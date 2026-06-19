@@ -29,25 +29,50 @@ BRANCH_CODE_SHEET = "ยิงส่ง - ITCBI"
 BKK_TZ = timezone(timedelta(hours=7))
 
 # ---------------------------------------------------------
-# ตัวนับรายวัน (รีเซ็ตทุกเที่ยงคืน 00:00)
+# ระบบเก็บ State จำนวน AWB แบบรายวัน และ รหัสสาขา
 # ---------------------------------------------------------
-daily_counter = {"date": None, "count": 0}
+STATE_FILE = "state.json"
+app_state = {
+    "current_date": "",
+    "daily_count": 0,
+    "branch_summary": {}
+}
 
+# โหลดข้อมูลเก่าถ้ามี
+if os.path.exists(STATE_FILE):
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            app_state = json.load(f)
+    except:
+        pass
 
-def get_daily_count():
-    """เช็คและรีเซ็ตตัวนับถ้าข้ามวัน"""
-    today = datetime.now(BKK_TZ).strftime("%d/%m/%Y")
-    if daily_counter["date"] != today:
-        daily_counter["date"] = today
-        daily_counter["count"] = 0
-    return daily_counter
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(app_state, f, ensure_ascii=False)
+    except:
+        pass
 
-
-def add_to_daily_count(count):
-    """เพิ่มจำนวนเข้าตัวนับรายวัน"""
-    dc = get_daily_count()
-    dc["count"] += count
-    return dc["count"], dc["date"]
+def add_to_daily_count(new_count, branch_list):
+    tz = timezone(timedelta(hours=7))
+    now = datetime.now(tz)
+    today_str = now.strftime("%d/%m/%Y")
+    
+    # ถ้าระบบข้ามวันแล้ว ให้รีเซ็ตตัวนับและสรุปยอดเป็น 0
+    if app_state.get("current_date") != today_str:
+        app_state["current_date"] = today_str
+        app_state["daily_count"] = 0
+        app_state["branch_summary"] = {}
+        
+    app_state["daily_count"] += new_count
+    
+    # นับยอดแต่ละรหัสสาขา
+    for br in branch_list:
+        if br:
+            app_state["branch_summary"][br] = app_state["branch_summary"].get(br, 0) + 1
+            
+    save_state()
+    return app_state["daily_count"], today_str
 
 
 # ---------------------------------------------------------
@@ -282,6 +307,32 @@ def process_event(data):
             content = json.loads(message.get("content", "{}"))
             text = content.get("text", "")
 
+            # --- ฟีเจอร์ "สรุปยอด" ---
+            if text.strip() == "สรุปยอด":
+                tz = timezone(timedelta(hours=7))
+                today_str = datetime.now(tz).strftime("%d/%m/%Y")
+                
+                if app_state.get("current_date") != today_str:
+                    reply_message(message_id, f"📊 สรุปยอดวันที่ {today_str}\nยังไม่มีข้อมูลในระบบครับ", token)
+                    return
+                
+                summary_text = f"📊 สรุปยอดวันที่ {today_str}\n"
+                summary_text += "━━━━━━━━━━━━━━━━━━━━\n"
+                
+                branch_summary = app_state.get("branch_summary", {})
+                if branch_summary:
+                    # เรียงตามรหัสสาขา
+                    for br in sorted(branch_summary.keys()):
+                        summary_text += f"🏢 สาขา {br} : {branch_summary[br]} รายการ\n"
+                else:
+                    summary_text += "ไม่มีข้อมูลรหัสสาขา\n"
+                    
+                summary_text += "━━━━━━━━━━━━━━━━━━━━\n"
+                summary_text += f"รวมทั้งหมด: {app_state.get('daily_count', 0)} รายการ\n"
+                
+                reply_message(message_id, summary_text, token)
+                return
+
             # ตรวจพบลูกน้ำ (,) ให้แจ้ง Error และหยุดการทำงานทันที
             if "," in text:
                 reply_message(
@@ -406,7 +457,7 @@ def process_event(data):
 
         # === อัปเดตตัวนับรายวัน ===
         total_awb = len(awb_list)
-        daily_total, today_date = add_to_daily_count(total_awb)
+        daily_total, today_date = add_to_daily_count(total_awb, branch_codes)
 
         # === สร้างข้อความสรุป ===
         summary = (
