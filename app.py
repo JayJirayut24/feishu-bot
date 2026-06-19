@@ -282,20 +282,42 @@ def process_event(data):
             content = json.loads(message.get("content", "{}"))
             text = content.get("text", "")
 
-            # ค้นหาเลข 12 หลัก
-            awb_list.extend(re.findall(r'(?<!\d)\d{12}(?!\d)', text))
-            # ค้นหารหัส B
-            awb_list.extend(re.findall(r'\bB\d+\b', text))
-            # ค้นหารหัสสาขา 6 หลัก
-            branch_codes.extend(re.findall(r'(?<!\d)\d{6}(?!\d)', text))
-            
-            # ลบ AWB ซ้ำ (แต่เก็บลำดับเดิม)
-            seen = set()
-            awb_list = [x for x in awb_list if not (x in seen or seen.add(x))]
+            # ตรวจพบลูกน้ำ (,) ให้แจ้ง Error และหยุดการทำงานทันที
+            if "," in text:
+                reply_message(
+                    message_id,
+                    f"⚠️ ตรวจพบเครื่องหมาย ( , ) ในข้อความ\nERROR กรุณาลบ , ออกแล้วส่งใหม่ครับ",
+                    token
+                )
+                return
 
-            # ถ้าระบุรหัสสาขามา 1 ตัว แต่มีหลาย AWB ให้เบิ้ลรหัสสาขาให้เท่ากับ AWB
-            if len(branch_codes) == 1 and len(awb_list) > 1:
-                branch_codes = [branch_codes[0]] * len(awb_list)
+            # ประมวลผลทีละบรรทัด ป้องกันบรรทัดเหลื่อมกัน
+            lines = text.split("\n")
+            for line in lines:
+                line_awbs = []
+                # ค้นหาเลข 12 หลัก
+                line_awbs.extend(re.findall(r'(?<!\d)\d{12}(?!\d)', line))
+                # ค้นหารหัส B
+                line_awbs.extend(re.findall(r'\bB\d+\b', line))
+                # ค้นหารหัสสาขา 6 หลัก
+                line_branches = re.findall(r'(?<!\d)\d{6}(?!\d)', line)
+
+                if not line_awbs and not line_branches:
+                    continue
+
+                # ลบ AWB ซ้ำในบรรทัดเดียวกัน (แต่เก็บลำดับเดิม)
+                seen = set()
+                line_awbs = [x for x in line_awbs if not (x in seen or seen.add(x))]
+
+                # ถ้าระบุรหัสสาขามา 1 ตัว แต่มีหลาย AWB ในบรรทัดนี้ ให้เบิ้ลรหัสสาขาให้เท่ากับ AWB
+                if len(line_branches) == 1 and len(line_awbs) > 1:
+                    line_branches = [line_branches[0]] * len(line_awbs)
+
+                # จับคู่ AWB กับ Branch เข้าด้วยกัน เพื่อป้องกันบรรทัดเหลื่อมข้ามบรรทัด
+                max_len = max(len(line_awbs), len(line_branches))
+                for i in range(max_len):
+                    awb_list.append(line_awbs[i] if i < len(line_awbs) else "")
+                    branch_codes.append(line_branches[i] if i < len(line_branches) else "")
 
             if awb_list or branch_codes:
                 is_valid_input = True
