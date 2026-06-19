@@ -173,21 +173,27 @@ def get_sheet_ids(spreadsheet_token, token):
 # ---------------------------------------------------------
 # ฟังก์ชันเพิ่มข้อมูลลงใน Feishu Spreadsheet
 # ---------------------------------------------------------
-def append_to_feishu_sheet(spreadsheet_token, sheet_id, data_list, column, token):
-    """เพิ่มข้อมูลต่อท้ายคอลัมน์ที่ระบุของ Sheet"""
+def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token):
     url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_append"
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json; charset=utf-8"
+        "Content-Type": "application/json"
     }
-
-    # จัดข้อมูลเป็นแถวๆ สำหรับคอลัมน์ที่ระบุ
-    values = [[item] for item in data_list]
+    
+    # แปลงข้อมูลเป็น array ของ array (Feishu ต้องการแบบนี้)
+    if len(values) > 0 and isinstance(values[0], list):
+        sheet_values = [[str(item) for item in row] for row in values]
+        max_cols = max(len(row) for row in sheet_values)
+        end_col = chr(ord(start_col.upper()) + max_cols - 1)
+        range_str = f"{sheet_id}!{start_col}:{end_col}"
+    else:
+        sheet_values = [[str(v)] for v in values]
+        range_str = f"{sheet_id}!{start_col}:{start_col}"
 
     payload = {
         "valueRange": {
-            "range": f"{sheet_id}!{column}:{column}",
-            "values": values
+            "range": range_str,
+            "values": sheet_values
         }
     }
 
@@ -343,33 +349,38 @@ def process_event(data):
 
         results = []
 
-        # === AWB → คอลัมน์ A ของทั้ง 2 Sheet ===
-        if awb_list:
-            for sheet_name, sheet_id in sheet_ids.items():
-                res = append_to_feishu_sheet(
-                    spreadsheet_token, sheet_id, awb_list, "A", token
-                )
-                code = res.get("code", -1)
-                if code == 0:
-                    results.append(f"✅ {sheet_name}: เพิ่ม AWB {len(awb_list)} รายการ")
-                else:
-                    msg = res.get("msg", "Unknown error")
-                    results.append(f"❌ {sheet_name}: {msg}")
-
-        # === รหัสสาขา → คอลัมน์ F ของ "ยิงส่ง - ITCBI" เท่านั้น ===
-        if branch_codes and BRANCH_CODE_SHEET in sheet_ids:
-            sheet_id = sheet_ids[BRANCH_CODE_SHEET]
-            res = append_to_feishu_sheet(
-                spreadsheet_token, sheet_id, branch_codes, "F", token
-            )
-            code = res.get("code", -1)
-            if code == 0:
-                results.append(
-                    f"✅ รหัสสาขา: เพิ่ม {len(branch_codes)} รายการ → ยิงส่ง - ITCBI (คอลัมน์ F)"
-                )
+        for sheet_name, sheet_id in sheet_ids.items():
+            if sheet_name == BRANCH_CODE_SHEET:
+                # "ยิงส่ง - ITCBI": รวม AWB กับรหัสสาขาเป็นบรรทัดเดียวกัน (A ถึง F)
+                rows = []
+                max_len = max(len(awb_list), len(branch_codes)) if branch_codes else len(awb_list)
+                for i in range(max_len):
+                    awb = awb_list[i] if i < len(awb_list) else ""
+                    br = branch_codes[i] if branch_codes and i < len(branch_codes) else ""
+                    if br:
+                        # [Col A, Col B, Col C, Col D, Col E, Col F]
+                        rows.append([awb, "", "", "", "", br])
+                    else:
+                        rows.append([awb]) # เขียนแค่คอลัมน์ A
+                
+                if rows:
+                    res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
+                    code = res.get("code", -1)
+                    if code == 0:
+                        results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
+                    else:
+                        msg = res.get("msg", "Unknown error")
+                        results.append(f"❌ {sheet_name}: {msg}")
             else:
-                msg = res.get("msg", "Unknown error")
-                results.append(f"❌ รหัสสาขา: {msg}")
+                # "ยิงถึง - ITCBI": มีแค่ AWB
+                if awb_list:
+                    res = append_to_feishu_sheet(spreadsheet_token, sheet_id, awb_list, "A", token)
+                    code = res.get("code", -1)
+                    if code == 0:
+                        results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
+                    else:
+                        msg = res.get("msg", "Unknown error")
+                        results.append(f"❌ {sheet_name}: {msg}")
 
         # === อัปเดตตัวนับรายวัน ===
         total_awb = len(awb_list)
