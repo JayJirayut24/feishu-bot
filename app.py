@@ -261,6 +261,48 @@ def process_event(data):
         elif message_type == "text":
             content = json.loads(message.get("content", "{}"))
             text = content.get("text", "")
+            # --- ฟีเจอร์ "ลบข้อมูล" (Clear/Reset) ---
+            clean_text = text.strip().lower()
+            if clean_text in ["clear", "ลบข้อมูล", "reset"]:
+                tz = timezone(timedelta(hours=7))
+                today_str = datetime.now(tz).strftime("%d/%m/%Y")
+                deleted_rows_total = 0
+                
+                for sheet_name, sheet_id in sheet_ids.items():
+                    col = "H" if sheet_name == BRANCH_CODE_SHEET else "F"
+                    values = get_feishu_sheet_column(spreadsheet_token, sheet_id, col, token)
+                    
+                    rows_to_delete = []
+                    for i, row in enumerate(values):
+                        if row and len(row) > 0 and str(row[0]).startswith(today_str):
+                            rows_to_delete.append(i + 1)
+                            
+                    if rows_to_delete:
+                        ranges = []
+                        start_r = rows_to_delete[0]
+                        end_r = rows_to_delete[0]
+                        for r in rows_to_delete[1:]:
+                            if r == end_r + 1:
+                                end_r = r
+                            else:
+                                ranges.append((start_r, end_r))
+                                start_r = r
+                                end_r = r
+                        ranges.append((start_r, end_r))
+                        
+                        # ลบจากล่างขึ้นบน เพื่อไม่ให้ index เพี้ยน
+                        for start_r, end_r in reversed(ranges):
+                            count = end_r - start_r + 1
+                            delete_feishu_sheet_rows(spreadsheet_token, sheet_id, start_r, count, token)
+                            deleted_rows_total += count
+                # รีเซ็ตตัวนับยอดรายวัน
+                app_state["current_date"] = today_str
+                app_state["daily_count"] = 0
+                app_state["branch_summary"] = {}
+                save_state()
+                
+                reply_message(message_id, f"🗑️ ทำการลบข้อมูลของวันที่ {today_str} ออกจาก Sheet ทั้งหมด {deleted_rows_total} แถว และรีเซ็ตยอดกลับเป็น 0 เรียบร้อยแล้วครับ", token)
+                return
             # --- ฟีเจอร์ "สรุปยอด" ---
             if text.strip() == "สรุปยอด":
                 tz = timezone(timedelta(hours=7))
@@ -372,19 +414,20 @@ def process_event(data):
             )
             return
         results = []
+        today_time_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M:%S")
         for sheet_name, sheet_id in sheet_ids.items():
             if sheet_name == BRANCH_CODE_SHEET:
-                # "ยิงส่ง - ITCBI": รวม AWB กับรหัสสาขาเป็นบรรทัดเดียวกัน (A ถึง F)
+                # "ยิงส่ง - ITCBI": รวม AWB กับรหัสสาขาเป็นบรรทัดเดียวกัน (A ถึง H)
                 rows = []
                 max_len = max(len(awb_list), len(branch_codes)) if branch_codes else len(awb_list)
                 for i in range(max_len):
                     awb = awb_list[i] if i < len(awb_list) else ""
                     br = branch_codes[i] if branch_codes and i < len(branch_codes) else ""
                     if br:
-                        # [Col A, Col B, Col C, Col D, Col E, Col F]
-                        rows.append([awb, "", "", "", "", br])
+                        # [Col A, Col B, Col C, Col D, Col E, Col F, Col G, Col H]
+                        rows.append([awb, "", "", "", "", br, "", today_time_str])
                     else:
-                        rows.append([awb]) # เขียนแค่คอลัมน์ A
+                        rows.append([awb, "", "", "", "", "", "", today_time_str]) # เขียนแค่คอลัมน์ A และลงเวลาที่ H
                 
                 if rows:
                     res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
@@ -395,9 +438,13 @@ def process_event(data):
                         msg = res.get("msg", "Unknown error")
                         results.append(f"❌ {sheet_name}: {msg}")
             else:
-                # "ยิงถึง - ITCBI": มีแค่ AWB
+                # "ยิงถึง - ITCBI": มีแค่ AWB และวันที่
                 if awb_list:
-                    res = append_to_feishu_sheet(spreadsheet_token, sheet_id, awb_list, "A", token)
+                    rows = []
+                    for awb in awb_list:
+                        # [Col A, Col B, Col C, Col D, Col E, Col F]
+                        rows.append([awb, "", "", "", "", today_time_str])
+                    res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
                     code = res.get("code", -1)
                     if code == 0:
                         results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
