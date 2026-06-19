@@ -251,6 +251,18 @@ def process_event(data):
                     # ดึงข้อมูลจาก Excel
                     awb_list, branch_codes = extract_data_from_excel(file_bytes)
 
+                    # --- ดึงรหัสสาขาจากชื่อไฟล์ (ถ้าใน Excel ไม่มีรหัสสาขา) ---
+                    if not branch_codes:
+                        # หาเลข 6 หลักจากชื่อไฟล์
+                        filename_branch_match = re.search(r'(?<!\d)(\d{6})(?!\d)', file_name)
+                        if filename_branch_match:
+                            branch_code_from_name = filename_branch_match.group(1)
+                            # ถ้ารู้จำนวน AWB แล้ว ให้เบิ้ลรหัสสาขาให้บรรทัดเท่ากัน
+                            if awb_list:
+                                branch_codes = [branch_code_from_name] * len(awb_list)
+                            else:
+                                branch_codes = [branch_code_from_name]
+
                     if not awb_list and not branch_codes:
                         reply_message(
                             message_id,
@@ -324,22 +336,16 @@ def process_event(data):
 
                     # === สร้างข้อความสรุป ===
                     summary = (
-                        f"📊 ผลการประมวลผลไฟล์ '{file_name}'\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🔢 จำนวน AWB: {count_12} เลข 12 หลัก และ {count_b} รหัส B "
-                        f"ที่กรอกลง feishu.cn\n"
                         f"📅 จำนวน AWB วันที่ {today_date} รวม {daily_total}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
                     )
 
-                    if branch_codes:
-                        summary += f"🏢 รหัสสาขา: {len(branch_codes)} รายการ\n"
+                    # ถ้ามีข้อผิดพลาด ให้แสดงด้วย (เพื่อความปลอดภัย)
+                    errors = [msg for msg in results if "❌" in msg]
+                    if errors:
+                        summary += "\n".join(errors) + "\n━━━━━━━━━━━━━━━━━━━━\n"
 
-                    summary += (
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        + "\n".join(results) + "\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"✅ ประมวลผลเสร็จสิ้น!"
-                    )
+                    summary += "✅ ประมวลผลเสร็จสิ้น!"
 
                     reply_message(message_id, summary, token)
                 else:
