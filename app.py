@@ -232,147 +232,163 @@ def process_event(data):
         message_type = message.get("message_type")
         message_id = message.get("message_id")
 
-        # ถ้าเป็นไฟล์
+        token = get_tenant_access_token()
+        awb_list = []
+        branch_codes = []
+        is_valid_input = False
+
+        # ---------------------------------------------
+        # 1. กรณีเป็นไฟล์
+        # ---------------------------------------------
         if message_type == "file":
             content = json.loads(message.get("content", "{}"))
             file_key = content.get("file_key")
             file_name = content.get("file_name", "")
 
             if file_name.endswith(".xlsx"):
-                token = get_tenant_access_token()
-
-                # ตอบกลับว่ากำลังทำงาน
+                is_valid_input = True
                 reply_message(message_id, f"⏳ กำลังประมวลผลไฟล์ '{file_name}'...", token)
 
-                # ดาวน์โหลดไฟล์
                 file_bytes = download_feishu_file(message_id, file_key, token)
-
                 if file_bytes:
-                    # ดึงข้อมูลจาก Excel
                     awb_list, branch_codes = extract_data_from_excel(file_bytes)
 
-                    # --- ดึงรหัสสาขาจากชื่อไฟล์ (ถ้าใน Excel ไม่มีรหัสสาขา) ---
+                    # ดึงรหัสสาขาจากชื่อไฟล์ (ถ้าใน Excel ไม่มีรหัสสาขา)
                     if not branch_codes:
-                        # หาเลข 6 หลักจากชื่อไฟล์
                         filename_branch_match = re.search(r'(?<!\d)(\d{6})(?!\d)', file_name)
                         if filename_branch_match:
                             branch_code_from_name = filename_branch_match.group(1)
-                            # ถ้ารู้จำนวน AWB แล้ว ให้เบิ้ลรหัสสาขาให้บรรทัดเท่ากัน
                             if awb_list:
                                 branch_codes = [branch_code_from_name] * len(awb_list)
                             else:
                                 branch_codes = [branch_code_from_name]
-
-                    if not awb_list and not branch_codes:
-                        reply_message(
-                            message_id,
-                            "⚠️ ไม่พบข้อมูล AWB (12 หลัก / รหัส B) หรือรหัสสาขา (6 หลัก) ในไฟล์นี้ครับ",
-                            token
-                        )
-                        return
-
-                    # ดึง Spreadsheet Token จาก Wiki
-                    spreadsheet_token, error_msg = get_spreadsheet_token(token)
-
-                    if not spreadsheet_token:
-                        reply_message(
-                            message_id,
-                            f"❌ ไม่สามารถเข้าถึง Wiki Spreadsheet ได้\n"
-                            f"สาเหตุ: {error_msg}\n"
-                            "กรุณาตรวจสอบว่า JIRAYUTBOT มีสิทธิ์เข้าถึง Wiki และ Sheet แล้ว",
-                            token
-                        )
-                        return
-
-                    # ดึง Sheet ID
-                    sheet_ids = get_sheet_ids(spreadsheet_token, token)
-
-                    if not sheet_ids:
-                        reply_message(
-                            message_id,
-                            "❌ ไม่พบ Sheet 'ยิงส่ง - ITCBI' หรือ 'ยิงถึง - ITCBI'\n"
-                            "กรุณาตรวจสอบชื่อ Sheet ใน Feishu Spreadsheet",
-                            token
-                        )
-                        return
-
-                    results = []
-
-                    # === AWB → คอลัมน์ A ของทั้ง 2 Sheet ===
-                    if awb_list:
-                        for sheet_name, sheet_id in sheet_ids.items():
-                            res = append_to_feishu_sheet(
-                                spreadsheet_token, sheet_id, awb_list, "A", token
-                            )
-                            code = res.get("code", -1)
-                            if code == 0:
-                                results.append(f"✅ {sheet_name}: เพิ่ม AWB {len(awb_list)} รายการ")
-                            else:
-                                msg = res.get("msg", "Unknown error")
-                                results.append(f"❌ {sheet_name}: {msg}")
-
-                    # === รหัสสาขา → คอลัมน์ F ของ "ยิงส่ง - ITCBI" เท่านั้น ===
-                    if branch_codes and BRANCH_CODE_SHEET in sheet_ids:
-                        sheet_id = sheet_ids[BRANCH_CODE_SHEET]
-                        res = append_to_feishu_sheet(
-                            spreadsheet_token, sheet_id, branch_codes, "F", token
-                        )
-                        code = res.get("code", -1)
-                        if code == 0:
-                            results.append(
-                                f"✅ รหัสสาขา: เพิ่ม {len(branch_codes)} รายการ → ยิงส่ง - ITCBI (คอลัมน์ F)"
-                            )
-                        else:
-                            msg = res.get("msg", "Unknown error")
-                            results.append(f"❌ รหัสสาขา: {msg}")
-
-                    # === อัปเดตตัวนับรายวัน ===
-                    total_awb = len(awb_list)
-                    daily_total, today_date = add_to_daily_count(total_awb)
-
-                    # นับแยกประเภท
-                    count_12 = sum(1 for a in awb_list if re.match(r'^\d{12}$', a))
-                    count_b = sum(1 for a in awb_list if re.match(r'^B\d+$', a))
-
-                    # === สร้างข้อความสรุป ===
-                    summary = (
-                        f"📅 จำนวน AWB วันที่ {today_date} รวม {daily_total}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                    )
-
-                    # ถ้ามีข้อผิดพลาด ให้แสดงด้วย (เพื่อความปลอดภัย)
-                    errors = [msg for msg in results if "❌" in msg]
-                    if errors:
-                        summary += "\n".join(errors) + "\n━━━━━━━━━━━━━━━━━━━━\n"
-
-                    summary += "✅ ประมวลผลเสร็จสิ้น!"
-
-                    reply_message(message_id, summary, token)
                 else:
-                    reply_message(
-                        message_id,
-                        "❌ ดาวน์โหลดไฟล์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง",
-                        token
-                    )
+                    reply_message(message_id, "❌ ดาวน์โหลดไฟล์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง", token)
+                    return
             else:
-                token = get_tenant_access_token()
+                reply_message(message_id, f"⚠️ รองรับเฉพาะไฟล์นามสกุล .xlsx เท่านั้นครับ", token)
+                return
+
+        # ---------------------------------------------
+        # 2. กรณีเป็นข้อความปกติ (พิมพ์เข้ามาในแชท)
+        # ---------------------------------------------
+        elif message_type == "text":
+            content = json.loads(message.get("content", "{}"))
+            text = content.get("text", "")
+
+            # ค้นหาเลข 12 หลัก
+            awb_list.extend(re.findall(r'(?<!\d)\d{12}(?!\d)', text))
+            # ค้นหารหัส B
+            awb_list.extend(re.findall(r'\bB\d+\b', text))
+            # ค้นหารหัสสาขา 6 หลัก
+            branch_codes.extend(re.findall(r'(?<!\d)\d{6}(?!\d)', text))
+            
+            # ลบ AWB ซ้ำ (แต่เก็บลำดับเดิม)
+            seen = set()
+            awb_list = [x for x in awb_list if not (x in seen or seen.add(x))]
+
+            # ถ้าระบุรหัสสาขามา 1 ตัว แต่มีหลาย AWB ให้เบิ้ลรหัสสาขาให้เท่ากับ AWB
+            if len(branch_codes) == 1 and len(awb_list) > 1:
+                branch_codes = [branch_codes[0]] * len(awb_list)
+
+            if awb_list or branch_codes:
+                is_valid_input = True
+                reply_message(message_id, f"⏳ กำลังบันทึกข้อมูลจากข้อความ...", token)
+            else:
                 reply_message(
                     message_id,
-                    f"⚠️ รองรับเฉพาะไฟล์นามสกุล .xlsx เท่านั้นครับ\n"
-                    f"ไฟล์ที่ส่งมา: {file_name}",
+                    "👋 สวัสดีครับ! ส่งไฟล์ Excel (.xlsx) หรือพิมพ์เลข AWB (12 หลัก), รหัส B, รหัสสาขา (6 หลัก) มาให้ผมได้เลยครับ",
                     token
                 )
+                return
 
-        # ถ้าเป็นข้อความปกติ
-        elif message_type == "text":
-            token = get_tenant_access_token()
+        # ==========================================
+        # เริ่มกระบวนการเขียนลง Feishu Sheet
+        # ==========================================
+        if not is_valid_input:
+            return
+
+        if not awb_list and not branch_codes:
             reply_message(
                 message_id,
-                "👋 สวัสดีครับ! ส่งไฟล์ Excel (.xlsx) มาได้เลย\n"
-                "ผมจะดึงเลข AWB (12 หลัก), รหัส B และรหัสสาขา (6 หลัก)\n"
-                "แล้วบันทึกลง Feishu Sheet ให้อัตโนมัติครับ!",
+                "⚠️ ไม่พบข้อมูล AWB (12 หลัก / รหัส B) หรือรหัสสาขา (6 หลัก) เลยครับ",
                 token
             )
+            return
+
+        # ดึง Spreadsheet Token จาก Wiki
+        spreadsheet_token, error_msg = get_spreadsheet_token(token)
+
+        if not spreadsheet_token:
+            reply_message(
+                message_id,
+                f"❌ ไม่สามารถเข้าถึง Wiki Spreadsheet ได้\n"
+                f"สาเหตุ: {error_msg}\n"
+                "กรุณาตรวจสอบว่า JIRAYUTBOT มีสิทธิ์เข้าถึง Wiki และ Sheet แล้ว",
+                token
+            )
+            return
+
+        # ดึง Sheet ID
+        sheet_ids = get_sheet_ids(spreadsheet_token, token)
+
+        if not sheet_ids:
+            reply_message(
+                message_id,
+                "❌ ไม่พบ Sheet 'ยิงส่ง - ITCBI' หรือ 'ยิงถึง - ITCBI'\n"
+                "กรุณาตรวจสอบชื่อ Sheet ใน Feishu Spreadsheet",
+                token
+            )
+            return
+
+        results = []
+
+        # === AWB → คอลัมน์ A ของทั้ง 2 Sheet ===
+        if awb_list:
+            for sheet_name, sheet_id in sheet_ids.items():
+                res = append_to_feishu_sheet(
+                    spreadsheet_token, sheet_id, awb_list, "A", token
+                )
+                code = res.get("code", -1)
+                if code == 0:
+                    results.append(f"✅ {sheet_name}: เพิ่ม AWB {len(awb_list)} รายการ")
+                else:
+                    msg = res.get("msg", "Unknown error")
+                    results.append(f"❌ {sheet_name}: {msg}")
+
+        # === รหัสสาขา → คอลัมน์ F ของ "ยิงส่ง - ITCBI" เท่านั้น ===
+        if branch_codes and BRANCH_CODE_SHEET in sheet_ids:
+            sheet_id = sheet_ids[BRANCH_CODE_SHEET]
+            res = append_to_feishu_sheet(
+                spreadsheet_token, sheet_id, branch_codes, "F", token
+            )
+            code = res.get("code", -1)
+            if code == 0:
+                results.append(
+                    f"✅ รหัสสาขา: เพิ่ม {len(branch_codes)} รายการ → ยิงส่ง - ITCBI (คอลัมน์ F)"
+                )
+            else:
+                msg = res.get("msg", "Unknown error")
+                results.append(f"❌ รหัสสาขา: {msg}")
+
+        # === อัปเดตตัวนับรายวัน ===
+        total_awb = len(awb_list)
+        daily_total, today_date = add_to_daily_count(total_awb)
+
+        # === สร้างข้อความสรุป ===
+        summary = (
+            f"📅 จำนวน AWB วันที่ {today_date} รวม {daily_total}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+        # ถ้ามีข้อผิดพลาด ให้แสดงด้วย
+        errors = [msg for msg in results if "❌" in msg]
+        if errors:
+            summary += "\n".join(errors) + "\n━━━━━━━━━━━━━━━━━━━━\n"
+
+        summary += "✅ ประมวลผลเสร็จสิ้น!"
+
+        reply_message(message_id, summary, token)
 
 # ---------------------------------------------------------
 # Webhook Endpoint (รับ Event จาก Feishu)
