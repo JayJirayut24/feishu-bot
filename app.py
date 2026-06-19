@@ -7,27 +7,22 @@ from flask import Flask, request, jsonify
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from openpyxl import load_workbook
-
 app = Flask(__name__)
-
 # ---------------------------------------------------------
 # ตั้งค่า App ID และ App Secret ของ Feishu
 # ---------------------------------------------------------
 APP_ID = "cli_aabfaea8b0619bfc"
 APP_SECRET = "3emUt5KWwH01BlhIKADP2bCb5C062oxt"
-
 # ---------------------------------------------------------
 # ตั้งค่า Feishu Wiki Spreadsheet ปลายทาง
 # ---------------------------------------------------------
 WIKI_TOKEN = "UbCZwapNyiN15YkEKADcFyUHnWf"
 TARGET_SHEET_NAMES = ["ยิงส่ง - ITCBI", "ยิงถึง - ITCBI"]
 BRANCH_CODE_SHEET = "ยิงส่ง - ITCBI"
-
 # ---------------------------------------------------------
 # Bangkok Timezone (UTC+7)
 # ---------------------------------------------------------
 BKK_TZ = timezone(timedelta(hours=7))
-
 # ---------------------------------------------------------
 # ระบบเก็บ State จำนวน AWB แบบรายวัน และ รหัสสาขา
 # ---------------------------------------------------------
@@ -37,7 +32,6 @@ app_state = {
     "daily_count": 0,
     "branch_summary": {}
 }
-
 # โหลดข้อมูลเก่าถ้ามี
 if os.path.exists(STATE_FILE):
     try:
@@ -45,14 +39,12 @@ if os.path.exists(STATE_FILE):
             app_state = json.load(f)
     except:
         pass
-
 def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(app_state, f, ensure_ascii=False)
     except:
         pass
-
 def add_to_daily_count(new_count, branch_list):
     tz = timezone(timedelta(hours=7))
     now = datetime.now(tz)
@@ -73,8 +65,6 @@ def add_to_daily_count(new_count, branch_list):
             
     save_state()
     return app_state["daily_count"], today_str
-
-
 # ---------------------------------------------------------
 # ฟังก์ชันขอ Token จาก Feishu
 # ---------------------------------------------------------
@@ -84,8 +74,6 @@ def get_tenant_access_token():
     payload = {"app_id": APP_ID, "app_secret": APP_SECRET}
     res = requests.post(url, json=payload).json()
     return res.get("tenant_access_token")
-
-
 # ---------------------------------------------------------
 # ฟังก์ชันดาวน์โหลดไฟล์จากแชท Feishu
 # ---------------------------------------------------------
@@ -97,8 +85,6 @@ def download_feishu_file(message_id, file_key, token):
     if res.status_code == 200:
         return res.content
     return None
-
-
 # ---------------------------------------------------------
 # ฟังก์ชันดึงข้อมูลจากไฟล์ Excel
 # ---------------------------------------------------------
@@ -113,21 +99,17 @@ def extract_data_from_excel(file_bytes):
         wb = load_workbook(filename=BytesIO(file_bytes), data_only=True, read_only=True)
         awb_list = []
         branch_codes = []
-
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             for row in ws.iter_rows(values_only=True):
                 for cell in row:
                     if cell is None:
                         continue
-
                     # แปลงค่าเซลล์เป็น string
                     cell_str = str(cell).strip()
-
                     # ถ้าเป็นตัวเลขทศนิยม (เช่น 7989935047501.0) ให้ตัด .0 ออก
                     if isinstance(cell, float) and cell == int(cell):
                         cell_str = str(int(cell))
-
                     # เงื่อนไข 1: ตัวเลข 12 หลักพอดี → AWB
                     if re.match(r'^\d{12}$', cell_str):
                         awb_list.append(cell_str)
@@ -137,9 +119,7 @@ def extract_data_from_excel(file_bytes):
                     # เงื่อนไข 3: ตัวเลข 6 หลักพอดี → รหัสสาขา
                     elif re.match(r'^\d{6}$', cell_str):
                         branch_codes.append(cell_str)
-
         wb.close()
-
         # ลบ AWB ซ้ำ (เก็บลำดับเดิม)
         seen_awb = set()
         unique_awb = []
@@ -147,14 +127,10 @@ def extract_data_from_excel(file_bytes):
             if awb not in seen_awb:
                 seen_awb.add(awb)
                 unique_awb.append(awb)
-
         # รหัสสาขาไม่ลบซ้ำ (เพราะ 1 รหัสสาขาอาจมีหลายพัสดุ)
         return unique_awb, branch_codes
-
     except Exception:
         return [], []
-
-
 # ---------------------------------------------------------
 # ฟังก์ชันดึง Spreadsheet Token จาก Wiki Token
 # ---------------------------------------------------------
@@ -170,8 +146,6 @@ def get_spreadsheet_token(token):
         return node.get("obj_token"), None
     except Exception as e:
         return None, f"Request Error: {str(e)}"
-
-
 # ---------------------------------------------------------
 # ฟังก์ชันดึง Sheet ID ของ Sheet ที่ต้องการ
 # ---------------------------------------------------------
@@ -182,19 +156,15 @@ def get_sheet_ids(spreadsheet_token, token):
     try:
         res = requests.get(url, headers=headers).json()
         sheets = res.get("data", {}).get("sheets", [])
-
         sheet_ids = {}
         for sheet in sheets:
             title = sheet.get("title", "")
             sheet_id = sheet.get("sheet_id", "")
             if title in TARGET_SHEET_NAMES:
                 sheet_ids[title] = sheet_id
-
         return sheet_ids
     except Exception:
         return {}
-
-
 # ---------------------------------------------------------
 # ฟังก์ชันเพิ่มข้อมูลลงใน Feishu Spreadsheet
 # ---------------------------------------------------------
@@ -214,23 +184,18 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
     else:
         sheet_values = [[str(v)] for v in values]
         range_str = f"{sheet_id}!{start_col}:{start_col}"
-
     payload = {
         "valueRange": {
             "range": range_str,
             "values": sheet_values
         }
     }
-
     params = {"insertDataOption": "INSERT_ROWS"}
-
     try:
         res = requests.post(url, headers=headers, json=payload, params=params).json()
         return res
     except Exception as e:
         return {"code": -1, "msg": str(e)}
-
-
 # ---------------------------------------------------------
 # ฟังก์ชันตอบกลับข้อความในแชท
 # ---------------------------------------------------------
@@ -246,8 +211,6 @@ def reply_message(message_id, text, token):
         "content": json.dumps({"text": text})
     }
     requests.post(url, headers=headers, json=payload)
-
-
 # ---------------------------------------------------------
 # ฟังก์ชันจัดการ Event แบบ Asynchronous
 # ---------------------------------------------------------
@@ -255,19 +218,15 @@ def process_event(data):
     """ประมวลผล Event ใน Background Thread เพื่อป้องกัน Feishu Timeout"""
     if "header" not in data or "event" not in data:
         return
-
     event_type = data["header"].get("event_type")
-
     if event_type == "im.message.receive_v1":
         message = data["event"].get("message", {})
         message_type = message.get("message_type")
         message_id = message.get("message_id")
-
         token = get_tenant_access_token()
         awb_list = []
         branch_codes = []
         is_valid_input = False
-
         # ---------------------------------------------
         # 1. กรณีเป็นไฟล์
         # ---------------------------------------------
@@ -275,15 +234,12 @@ def process_event(data):
             content = json.loads(message.get("content", "{}"))
             file_key = content.get("file_key")
             file_name = content.get("file_name", "")
-
             if file_name.endswith(".xlsx"):
                 is_valid_input = True
                 reply_message(message_id, f"⏳ กำลังประมวลผลไฟล์ '{file_name}'...", token)
-
                 file_bytes = download_feishu_file(message_id, file_key, token)
                 if file_bytes:
                     awb_list, branch_codes = extract_data_from_excel(file_bytes)
-
                     # ดึงรหัสสาขาจากชื่อไฟล์ (ถ้าใน Excel ไม่มีรหัสสาขา)
                     if not branch_codes:
                         filename_branch_match = re.search(r'(?<!\d)(\d{6})(?!\d)', file_name)
@@ -299,14 +255,12 @@ def process_event(data):
             else:
                 reply_message(message_id, f"⚠️ รองรับเฉพาะไฟล์นามสกุล .xlsx เท่านั้นครับ", token)
                 return
-
         # ---------------------------------------------
         # 2. กรณีเป็นข้อความปกติ (พิมพ์เข้ามาในแชท)
         # ---------------------------------------------
         elif message_type == "text":
             content = json.loads(message.get("content", "{}"))
             text = content.get("text", "")
-
             # --- ฟีเจอร์ "สรุปยอด" ---
             if text.strip() == "สรุปยอด":
                 tz = timezone(timedelta(hours=7))
@@ -332,7 +286,6 @@ def process_event(data):
                 
                 reply_message(message_id, summary_text, token)
                 return
-
             # ตรวจพบลูกน้ำ (,) ให้แจ้ง Error และหยุดการทำงานทันที
             if "," in text:
                 reply_message(
@@ -341,9 +294,10 @@ def process_event(data):
                     token
                 )
                 return
-
             # ประมวลผลทีละบรรทัด ป้องกันบรรทัดเหลื่อมกัน
             lines = text.split("\n")
+            current_branch = ""
+            
             for line in lines:
                 line_awbs = []
                 # ค้นหาเลข 12 หลัก
@@ -352,24 +306,28 @@ def process_event(data):
                 line_awbs.extend(re.findall(r'\bB\d+\b', line))
                 # ค้นหารหัสสาขา 6 หลัก
                 line_branches = re.findall(r'(?<!\d)\d{6}(?!\d)', line)
-
                 if not line_awbs and not line_branches:
                     continue
-
                 # ลบ AWB ซ้ำในบรรทัดเดียวกัน (แต่เก็บลำดับเดิม)
                 seen = set()
                 line_awbs = [x for x in line_awbs if not (x in seen or seen.add(x))]
-
+                if line_branches:
+                    # ถ้าเจอสาขา ให้จำสาขาล่าสุดเอาไว้เผื่อบรรทัดถัดไปไม่มี
+                    current_branch = line_branches[-1]
+                elif line_awbs and current_branch:
+                    # ถ้าบรรทัดนี้มี AWB แต่ไม่มีสาขา ให้เอาสาขาที่จำไว้มาเติมให้
+                    line_branches = [current_branch] * len(line_awbs)
                 # ถ้าระบุรหัสสาขามา 1 ตัว แต่มีหลาย AWB ในบรรทัดนี้ ให้เบิ้ลรหัสสาขาให้เท่ากับ AWB
                 if len(line_branches) == 1 and len(line_awbs) > 1:
                     line_branches = [line_branches[0]] * len(line_awbs)
-
+                # ถ้าบรรทัดนี้มีแค่ "รหัสสาขา" (ไม่มี AWB) เราจะไม่สร้างบรรทัดว่างๆ ใน Sheet! (แค่จำไว้เฉยๆ)
+                if not line_awbs:
+                    continue
                 # จับคู่ AWB กับ Branch เข้าด้วยกัน เพื่อป้องกันบรรทัดเหลื่อมข้ามบรรทัด
                 max_len = max(len(line_awbs), len(line_branches))
                 for i in range(max_len):
                     awb_list.append(line_awbs[i] if i < len(line_awbs) else "")
                     branch_codes.append(line_branches[i] if i < len(line_branches) else "")
-
             if awb_list or branch_codes:
                 is_valid_input = True
                 reply_message(message_id, f"⏳ กำลังบันทึกข้อมูลจากข้อความ...", token)
@@ -380,13 +338,11 @@ def process_event(data):
                     token
                 )
                 return
-
         # ==========================================
         # เริ่มกระบวนการเขียนลง Feishu Sheet
         # ==========================================
         if not is_valid_input:
             return
-
         if not awb_list and not branch_codes:
             reply_message(
                 message_id,
@@ -394,10 +350,8 @@ def process_event(data):
                 token
             )
             return
-
         # ดึง Spreadsheet Token จาก Wiki
         spreadsheet_token, error_msg = get_spreadsheet_token(token)
-
         if not spreadsheet_token:
             reply_message(
                 message_id,
@@ -407,10 +361,8 @@ def process_event(data):
                 token
             )
             return
-
         # ดึง Sheet ID
         sheet_ids = get_sheet_ids(spreadsheet_token, token)
-
         if not sheet_ids:
             reply_message(
                 message_id,
@@ -419,9 +371,7 @@ def process_event(data):
                 token
             )
             return
-
         results = []
-
         for sheet_name, sheet_id in sheet_ids.items():
             if sheet_name == BRANCH_CODE_SHEET:
                 # "ยิงส่ง - ITCBI": รวม AWB กับรหัสสาขาเป็นบรรทัดเดียวกัน (A ถึง F)
@@ -454,53 +404,40 @@ def process_event(data):
                     else:
                         msg = res.get("msg", "Unknown error")
                         results.append(f"❌ {sheet_name}: {msg}")
-
         # === อัปเดตตัวนับรายวัน ===
         total_awb = len(awb_list)
         daily_total, today_date = add_to_daily_count(total_awb, branch_codes)
-
         # === สร้างข้อความสรุป ===
         summary = (
             f"📅 จำนวน AWB วันที่ {today_date} รวม {daily_total}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
         )
-
         # ถ้ามีข้อผิดพลาด ให้แสดงด้วย
         errors = [msg for msg in results if "❌" in msg]
         if errors:
             summary += "\n".join(errors) + "\n━━━━━━━━━━━━━━━━━━━━\n"
-
         summary += "✅ ประมวลผลเสร็จสิ้น!"
-
         reply_message(message_id, summary, token)
-
 # ---------------------------------------------------------
 # Webhook Endpoint (รับ Event จาก Feishu)
 # ---------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
-
     # ขั้นตอนที่ 1: ยืนยัน URL Challenge
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
-
     # ขั้นตอนที่ 2: รันการประมวลผลใน Background Thread
     thread = threading.Thread(target=process_event, args=(data,))
     thread.start()
-
     # ตอบกลับ Feishu ทันทีว่า "รับทราบแล้ว" เพื่อไม่ให้ Feishu ส่งซ้ำ
     return jsonify({"status": "ok"})
-
-
 # ---------------------------------------------------------
 # Health Check
 # ---------------------------------------------------------
 @app.route("/", methods=["GET"])
 def health():
     return "JIRAYUTBOT is running! 🤖"
-
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
