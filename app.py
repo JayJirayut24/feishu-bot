@@ -103,8 +103,8 @@ def extract_data_from_excel(file_bytes):
                     if isinstance(cell, float) and cell == int(cell):
                         cell_str = str(int(cell))
 
-                    # เงื่อนไข 1: ตัวเลข 13 หลักพอดี → AWB
-                    if re.match(r'^\d{13}$', cell_str):
+                    # เงื่อนไข 1: ตัวเลข 12 หลักพอดี → AWB
+                    if re.match(r'^\d{12}$', cell_str):
                         awb_list.append(cell_str)
                     # เงื่อนไข 2: ขึ้นต้นด้วย B ตามด้วยตัวเลข → AWB
                     elif re.match(r'^B\d+$', cell_str):
@@ -254,7 +254,7 @@ def process_event(data):
                     if not awb_list and not branch_codes:
                         reply_message(
                             message_id,
-                            "⚠️ ไม่พบข้อมูล AWB (13 หลัก / รหัส B) หรือรหัสสาขา (6 หลัก) ในไฟล์นี้ครับ",
+                            "⚠️ ไม่พบข้อมูล AWB (12 หลัก / รหัส B) หรือรหัสสาขา (6 หลัก) ในไฟล์นี้ครับ",
                             token
                         )
                         return
@@ -319,14 +319,14 @@ def process_event(data):
                     daily_total, today_date = add_to_daily_count(total_awb)
 
                     # นับแยกประเภท
-                    count_13 = sum(1 for a in awb_list if re.match(r'^\d{13}$', a))
+                    count_12 = sum(1 for a in awb_list if re.match(r'^\d{12}$', a))
                     count_b = sum(1 for a in awb_list if re.match(r'^B\d+$', a))
 
                     # === สร้างข้อความสรุป ===
                     summary = (
                         f"📊 ผลการประมวลผลไฟล์ '{file_name}'\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🔢 จำนวน AWB: {count_13} เลข 13 หลัก และ {count_b} รหัส B "
+                        f"🔢 จำนวน AWB: {count_12} เลข 12 หลัก และ {count_b} รหัส B "
                         f"ที่กรอกลง feishu.cn\n"
                         f"📅 จำนวน AWB วันที่ {today_date} รวม {daily_total}\n"
                     )
@@ -363,7 +363,7 @@ def process_event(data):
             reply_message(
                 message_id,
                 "👋 สวัสดีครับ! ส่งไฟล์ Excel (.xlsx) มาได้เลย\n"
-                "ผมจะดึงเลข AWB (13 หลัก), รหัส B และรหัสสาขา (6 หลัก)\n"
+                "ผมจะดึงเลข AWB (12 หลัก), รหัส B และรหัสสาขา (6 หลัก)\n"
                 "แล้วบันทึกลง Feishu Sheet ให้อัตโนมัติครับ!",
                 token
             )
