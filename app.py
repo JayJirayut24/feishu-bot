@@ -284,14 +284,15 @@ def get_sheet_ids(spreadsheet_token, token):
 # ---------------------------------------------------------
 # ฟังก์ชันเพิ่มข้อมูลลงใน Feishu Spreadsheet
 # ---------------------------------------------------------
-def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token):
+def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token,
+                           insert_mode="INSERT_ROWS"):
     url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_append"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
-    
-    # แปลงข้อมูลเป็น array ของ array (None → null ใน JSON เพื่อไม่ทับเซลล์ที่มีสูตร)
+
+    # None → null ใน JSON เพื่อไม่ทับเซลล์ที่มีสูตร
     if len(values) > 0 and isinstance(values[0], list):
         sheet_values = [
             [None if item is None else str(item) for item in row]
@@ -304,20 +305,105 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
         sheet_values = [[None if v is None else str(v)] for v in values]
         range_str = f"{sheet_id}!{start_col}:{start_col}"
 
-    payload = {
-        "valueRange": {
-            "range": range_str,
-            "values": sheet_values
-        }
-    }
-
-    params = {"insertDataOption": "INSERT_ROWS"}
+    payload = {"valueRange": {"range": range_str, "values": sheet_values}}
+    params = {"insertDataOption": insert_mode}
 
     try:
         res = requests.post(url, headers=headers, json=payload, params=params).json()
         return res
     except Exception as e:
         return {"code": -1, "msg": str(e)}
+
+
+# ---------------------------------------------------------
+# เขียนข้อมูลลง ยิงส่ง - ITCBI โดยไม่แตะคอลัมน์ G เลย
+# (ค้นหาแถวว่าง → PUT เฉพาะ A, F, H)
+# ---------------------------------------------------------
+def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timestamp, token):
+    api_headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    put_url = (
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+        f"{spreadsheet_token}/values"
+    )
+
+    # 1. หาแถวถัดไปที่ว่าง (อ่าน A2:A5000)
+    read_url = (
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+        f"{spreadsheet_token}/values/{sheet_id}!A2:A5000"
+    )
+    next_row = 2
+    try:
+        raw = (
+            requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
+            .json()
+            .get("data", {}).get("valueRange", {}).get("values") or []
+        )
+        last_idx = -1
+        for i, row in enumerate(raw):
+            if row and row[0] not in (None, "", "None"):
+                last_idx = i
+        if last_idx >= 0:
+            next_row = last_idx + 3  # raw[i]=A(i+2), แถวถัดไป = A(i+3)
+    except Exception:
+        pass
+
+    n = len(awb_list)
+    if n == 0:
+        return {"code": 0}
+    end_row = next_row + n - 1
+
+    # 2. PUT เฉพาะ A (AWB), F (สาขา), H (เวลา) — ไม่แตะ B C D E G
+    errors = []
+
+    res_a = requests.put(put_url, headers=api_headers, json={
+        "valueRange": {
+            "range": f"{sheet_id}!A{next_row}:A{end_row}",
+            "values": [[awb] for awb in awb_list]
+        }
+    })
+    try:
+        d = res_a.json()
+        if d.get("code", -1) != 0:
+            errors.append(f"A: {d.get('msg')}")
+    except Exception:
+        pass
+
+    f_values = []
+    for i in range(n):
+        br = branch_codes[i] if branch_codes and i < len(branch_codes) else ""
+        f_values.append([br])
+    res_f = requests.put(put_url, headers=api_headers, json={
+        "valueRange": {
+            "range": f"{sheet_id}!F{next_row}:F{end_row}",
+            "values": f_values
+        }
+    })
+    try:
+        d = res_f.json()
+        if d.get("code", -1) != 0:
+            errors.append(f"F: {d.get('msg')}")
+    except Exception:
+        pass
+
+    res_h = requests.put(put_url, headers=api_headers, json={
+        "valueRange": {
+            "range": f"{sheet_id}!H{next_row}:H{end_row}",
+            "values": [[timestamp]] * n
+        }
+    })
+    try:
+        d = res_h.json()
+        if d.get("code", -1) != 0:
+            errors.append(f"H: {d.get('msg')}")
+    except Exception:
+        pass
+
+    if errors:
+        return {"code": -1, "msg": " | ".join(errors)}
+    return {"code": 0}
 
 
 # ---------------------------------------------------------
@@ -630,24 +716,15 @@ def process_event(data):
 
         for sheet_name, sheet_id in sheet_ids.items():
             if sheet_name == BRANCH_CODE_SHEET:
-                # "ยิงส่ง - ITCBI": รวม AWB กับรหัสสาขาเป็นบรรทัดเดียวกัน (A ถึง H)
-                rows = []
-                max_len = max(len(awb_list), len(branch_codes)) if branch_codes else len(awb_list)
-                for i in range(max_len):
-                    awb = awb_list[i] if i < len(awb_list) else ""
-                    br = branch_codes[i] if branch_codes and i < len(branch_codes) else ""
-                    # None = null ใน JSON → Feishu ข้ามเซลล์นั้น (ไม่ทับสูตรที่ผูกไว้)
-                    # [Col A,  B,    C,    D,    E,    F,                 G,    H            ]
-                    rows.append([awb, None, None, None, None, br or None, None, today_time_str])
-                
-                if rows:
-                    res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
-                    code = res.get("code", -1)
-                    if code == 0:
-                        results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
-                    else:
-                        msg = res.get("msg", "Unknown error")
-                        results.append(f"❌ {sheet_name}: {msg}")
+                # "ยิงส่ง - ITCBI": PUT เฉพาะ A, F, H — ไม่แตะ G เลย
+                res = write_song_sheet(
+                    spreadsheet_token, sheet_id,
+                    awb_list, branch_codes, today_time_str, token
+                )
+                if res.get("code", -1) == 0:
+                    results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
+                else:
+                    results.append(f"❌ {sheet_name}: {res.get('msg', 'Unknown error')}")
             else:
                 # "ยิงถึง - ITCBI": มีแค่ AWB และวันที่
                 if awb_list:
