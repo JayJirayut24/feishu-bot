@@ -195,9 +195,9 @@ def extract_data_from_excel(file_bytes):
                 awb_list, branch_codes = deduped_awb, deduped_br
 
             else:
-                # โหมดปกติ: Pre-scan หาคอลัมน์ที่ค่า 6 หลักเหมือนกันทุกแถว → ข้ามคอลัมน์นั้น
+                # โหมดปกติ: ข้ามแถวแรก (header) แล้ว pre-scan หาคอลัมน์ที่ค่า 6 หลักเหมือนกันทุกแถว
                 col_six = {}
-                for row in all_rows:
+                for row in all_rows[1:]:
                     if not row:
                         continue
                     for j, cell in enumerate(row):
@@ -209,7 +209,7 @@ def extract_data_from_excel(file_bytes):
                 skip_cols = {j for j, vals in col_six.items()
                              if len(vals) > 1 and len(set(vals)) == 1}
 
-                for row in all_rows:
+                for row in all_rows[1:]:
                     if not row:
                         continue
                     for j, cell in enumerate(row):
