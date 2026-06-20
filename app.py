@@ -238,37 +238,55 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
 
 
 # ---------------------------------------------------------
-# ฟังก์ชันล้างข้อมูลทุกคอลัมน์ใน Sheet ทั้งหมด (Batch Clear)
+# ฟังก์ชันล้างข้อมูลทุกคอลัมน์ใน Sheet (เขียนค่าว่างทับ)
 # ---------------------------------------------------------
 def clear_all_sheet_columns(spreadsheet_token, sheet_ids_dict, token):
-    """ล้างค่าเซลล์ทุกคอลัมน์ใน Sheet ทั้ง 2 แผ่น เริ่มจากแถว 2 (เก็บ header ไว้)"""
-    ranges = []
-    for sheet_name, sheet_id in sheet_ids_dict.items():
-        if sheet_name == BRANCH_CODE_SHEET:
-            ranges.append(f"{sheet_id}!A2:H10000")  # ยิงส่ง: col A-H
-        else:
-            ranges.append(f"{sheet_id}!A2:F10000")  # ยิงถึง: col A-F
-
-    url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_batch_clear"
-    headers = {
+    """อ่านจำนวนแถวที่มีข้อมูล แล้วเขียนค่าว่างทับทุก column (เก็บ header row ไว้)"""
+    auth_headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
-    payload = {"ranges": ranges}
-    try:
-        res = requests.delete(url, headers=headers, json=payload)
-        # Feishu บางครั้งคืน response ที่ไม่ใช่ JSON → เช็ค status code ก่อน
+
+    errors = []
+
+    for sheet_name, sheet_id in sheet_ids_dict.items():
+        col_end = "H" if sheet_name == BRANCH_CODE_SHEET else "F"
+        num_cols = 8 if sheet_name == BRANCH_CODE_SHEET else 6
+
+        # 1. อ่านคอลัมน์ A เพื่อนับว่ามีกี่แถวข้อมูล (ข้าม header แถวที่ 1)
+        read_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}!A2:A10000"
         try:
-            data = res.json()
-            if data.get("code", -1) == 0:
-                return True, ""
-            return False, f"code={data.get('code')} msg={data.get('msg', '?')}"
-        except ValueError:
-            if res.status_code in (200, 204):
-                return True, ""
-            return False, f"HTTP {res.status_code}: {res.text[:200]}"
-    except Exception as e:
-        return False, str(e)
+            read_res = requests.get(read_url, headers={"Authorization": f"Bearer {token}"}).json()
+            existing = read_res.get("data", {}).get("valueRange", {}).get("values", [])
+            num_rows = len(existing)
+        except Exception:
+            num_rows = 0
+
+        if num_rows == 0:
+            continue  # ไม่มีข้อมูล ข้ามไป
+
+        # 2. เขียนค่าว่างทับทุกแถว (แถว 2 ถึง num_rows+1)
+        empty_rows = [[""] * num_cols for _ in range(num_rows)]
+        range_str = f"{sheet_id}!A2:{col_end}{num_rows + 1}"
+
+        put_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values"
+        payload = {"valueRange": {"range": range_str, "values": empty_rows}}
+
+        try:
+            res = requests.put(put_url, headers=auth_headers, json=payload)
+            try:
+                data = res.json()
+                if data.get("code", -1) != 0:
+                    errors.append(f"{sheet_name}: code={data.get('code')} msg={data.get('msg', '?')}")
+            except ValueError:
+                if res.status_code not in (200, 204):
+                    errors.append(f"{sheet_name}: HTTP {res.status_code}")
+        except Exception as e:
+            errors.append(f"{sheet_name}: {str(e)}")
+
+    if errors:
+        return False, " | ".join(errors)
+    return True, ""
 
 
 # ---------------------------------------------------------
