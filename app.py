@@ -291,14 +291,17 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
         "Content-Type": "application/json"
     }
     
-    # แปลงข้อมูลเป็น array ของ array (Feishu ต้องการแบบนี้)
+    # แปลงข้อมูลเป็น array ของ array (None → null ใน JSON เพื่อไม่ทับเซลล์ที่มีสูตร)
     if len(values) > 0 and isinstance(values[0], list):
-        sheet_values = [[str(item) for item in row] for row in values]
+        sheet_values = [
+            [None if item is None else str(item) for item in row]
+            for row in values
+        ]
         max_cols = max(len(row) for row in sheet_values)
         end_col = chr(ord(start_col.upper()) + max_cols - 1)
         range_str = f"{sheet_id}!{start_col}:{end_col}"
     else:
-        sheet_values = [[str(v)] for v in values]
+        sheet_values = [[None if v is None else str(v)] for v in values]
         range_str = f"{sheet_id}!{start_col}:{start_col}"
 
     payload = {
@@ -633,11 +636,9 @@ def process_event(data):
                 for i in range(max_len):
                     awb = awb_list[i] if i < len(awb_list) else ""
                     br = branch_codes[i] if branch_codes and i < len(branch_codes) else ""
-                    if br:
-                        # [Col A, Col B, Col C, Col D, Col E, Col F, Col G, Col H]
-                        rows.append([awb, "", "", "", "", br, "", today_time_str])
-                    else:
-                        rows.append([awb, "", "", "", "", "", "", today_time_str]) # เขียนแค่คอลัมน์ A และลงเวลาที่ H
+                    # None = null ใน JSON → Feishu ข้ามเซลล์นั้น (ไม่ทับสูตรที่ผูกไว้)
+                    # [Col A,  B,    C,    D,    E,    F,                 G,    H            ]
+                    rows.append([awb, None, None, None, None, br or None, None, today_time_str])
                 
                 if rows:
                     res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
@@ -652,8 +653,8 @@ def process_event(data):
                 if awb_list:
                     rows = []
                     for awb in awb_list:
-                        # [Col A, Col B, Col C, Col D, Col E, Col F]
-                        rows.append([awb, "", "", "", "", today_time_str])
+                        # [Col A,  B,    C,    D,    E,    F            ]
+                        rows.append([awb, None, None, None, None, today_time_str])
                     res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
                     code = res.get("code", -1)
                     if code == 0:
