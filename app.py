@@ -318,7 +318,7 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
 
 
 # ---------------------------------------------------------
-# ฟังก์ชันล้างข้อมูลทุกคอลัมน์ใน Sheet (เขียนค่าว่างทับ)
+# ฟังก์ชันล้างข้อมูลทุกแถวใน Sheet (ลบแถวจริง ไม่ใช่แค่ล้าง)
 # ---------------------------------------------------------
 def clear_all_sheet_columns(spreadsheet_token, sheet_ids_dict, token):
     auth_headers = {
@@ -328,35 +328,48 @@ def clear_all_sheet_columns(spreadsheet_token, sheet_ids_dict, token):
     errors = []
 
     for sheet_name, sheet_id in sheet_ids_dict.items():
-        col_end = "H" if sheet_name == BRANCH_CODE_SHEET else "F"
-        num_cols = 8 if sheet_name == BRANCH_CODE_SHEET else 6
-
-        # 1. อ่านคอลัมน์ A เพื่อนับแถวที่มีข้อมูลจริง (ข้าม null/ว่าง)
-        read_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}!A2:A5000"
+        # 1. อ่านคอลัมน์ A เพื่อหาแถวสุดท้ายที่มีข้อมูล
+        read_url = (
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+            f"{spreadsheet_token}/values/{sheet_id}!A2:A5000"
+        )
+        last_data_row = 0
         try:
-            read_res = requests.get(read_url, headers={"Authorization": f"Bearer {token}"}).json()
+            read_res = requests.get(
+                read_url, headers={"Authorization": f"Bearer {token}"}
+            ).json()
             raw = read_res.get("data", {}).get("valueRange", {}).get("values") or []
-            num_rows = sum(1 for row in raw if row and row[0] not in (None, "", "None"))
+            for i, row in enumerate(raw):
+                if row and row[0] not in (None, "", "None"):
+                    last_data_row = i + 1  # relative index (1-based from row 2)
         except Exception:
-            num_rows = 0
+            last_data_row = 0
 
-        if num_rows == 0:
+        if last_data_row == 0:
             continue
 
-        # 2. เขียนค่าว่างทับทุกแถว (แถว 2 ถึง num_rows+1) ด้วย values_batch_update
-        last_row = num_rows + 1
-        empty_rows = [[""] * num_cols for _ in range(num_rows)]
-        range_str = f"{sheet_id}!A2:{col_end}{last_row}"
-
-        put_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_batch_update"
-        payload = {"valueRanges": [{"range": range_str, "values": empty_rows}]}
-
+        # 2. ลบแถวด้วย DELETE /dimension_range
+        # startIndex=1 = row 2 (0-based), endIndex=last_data_row+1 (exclusive)
+        delete_url = (
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+            f"{spreadsheet_token}/dimension_range"
+        )
+        payload = {
+            "dimension": {
+                "sheetId": sheet_id,
+                "majorDimension": "ROWS",
+                "startIndex": 1,
+                "endIndex": last_data_row + 1
+            }
+        }
         try:
-            res = requests.put(put_url, headers=auth_headers, json=payload)
+            res = requests.delete(delete_url, headers=auth_headers, json=payload)
             try:
                 data = res.json()
                 if data.get("code", -1) != 0:
-                    errors.append(f"{sheet_name} [range={range_str}]: code={data.get('code')} msg={data.get('msg', '?')}")
+                    errors.append(
+                        f"{sheet_name}: code={data.get('code')} msg={data.get('msg', '?')}"
+                    )
             except ValueError:
                 if res.status_code not in (200, 204):
                     errors.append(f"{sheet_name}: HTTP {res.status_code}")
