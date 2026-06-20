@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import unicodedata
 import requests
 import threading
 from flask import Flask, request, jsonify
@@ -109,12 +110,15 @@ def download_feishu_file(message_id, file_key, token):
 # ฟังก์ชันดึงข้อมูลจากไฟล์ Excel
 # ---------------------------------------------------------
 def _cell_to_str(cell):
-    """แปลงค่า cell เป็น string ตัด .0 ออกถ้าเป็น float"""
     if cell is None:
         return ""
     if isinstance(cell, float) and cell == int(cell):
         return str(int(cell))
     return str(cell).strip()
+
+def _normalize(text):
+    """Normalize Unicode + ลบ whitespace เพื่อเปรียบเทียบ header ภาษาไทยได้แม่นยำ"""
+    return unicodedata.normalize("NFC", "".join(text.split()))
 
 def extract_data_from_excel(file_bytes):
     try:
@@ -128,24 +132,31 @@ def extract_data_from_excel(file_bytes):
             if not all_rows:
                 continue
 
-            # ตรวจหาคอลัมน์ "สาขาที่ถูกต้อง" และ "AWB" ในแถว header
-            header = all_rows[0]
+            # === ค้นหา header "สาขาที่ถูกต้อง" ใน 5 แถวแรก ===
+            TARGET = _normalize("สาขาที่ถูกต้อง")
             correct_branch_col = None
             awb_col = None
-            for i, cell in enumerate(header):
-                h = _cell_to_str(cell)
-                if "สาขาที่ถูกต้อง" in h:
-                    correct_branch_col = i
-                if h.upper() == "AWB":
-                    awb_col = i
+            data_start_row = 0
+
+            for row_idx, row in enumerate(all_rows[:5]):
+                if not row:
+                    continue
+                for i, cell in enumerate(row):
+                    h = _normalize(_cell_to_str(cell))
+                    if TARGET in h:
+                        correct_branch_col = i
+                    if h.upper() == "AWB":
+                        awb_col = i
+                if correct_branch_col is not None:
+                    data_start_row = row_idx + 1
+                    break
 
             if correct_branch_col is not None:
                 # โหมดพิเศษ: จับคู่ AWB กับสาขาที่ถูกต้องตามคอลัมน์
-                for row in all_rows[1:]:
+                for row in all_rows[data_start_row:]:
                     if not row:
                         continue
 
-                    # ค้นหา AWB — ใช้คอลัมน์ AWB ก่อน ถ้าไม่มี header ให้ scan ทั้งแถว
                     awb_str = ""
                     if awb_col is not None and awb_col < len(row):
                         candidate = _cell_to_str(row[awb_col])
@@ -162,9 +173,8 @@ def extract_data_from_excel(file_bytes):
                                 break
 
                     if not awb_str:
-                        continue  # แถวนี้ไม่มี AWB → ข้าม
+                        continue
 
-                    # ดึงสาขาที่ถูกต้องจากคอลัมน์ที่กำหนด
                     branch_str = ""
                     if correct_branch_col < len(row):
                         candidate = _cell_to_str(row[correct_branch_col])
@@ -185,9 +195,26 @@ def extract_data_from_excel(file_bytes):
                 awb_list, branch_codes = deduped_awb, deduped_br
 
             else:
-                # โหมดปกติ: scan ทุก cell หาเลข 12 หลักและ 6 หลัก
+                # โหมดปกติ: Pre-scan หาคอลัมน์ที่ค่า 6 หลักเหมือนกันทุกแถว → ข้ามคอลัมน์นั้น
+                col_six = {}
                 for row in all_rows:
-                    for cell in row:
+                    if not row:
+                        continue
+                    for j, cell in enumerate(row):
+                        v = _cell_to_str(cell)
+                        if v and re.match(r'^\d{6}$', v):
+                            col_six.setdefault(j, []).append(v)
+
+                # คอลัมน์ที่ทุกค่าเหมือนกัน (เช่น 812087 ทั้งหมด) = สาขาผิด → ข้าม
+                skip_cols = {j for j, vals in col_six.items()
+                             if len(vals) > 1 and len(set(vals)) == 1}
+
+                for row in all_rows:
+                    if not row:
+                        continue
+                    for j, cell in enumerate(row):
+                        if j in skip_cols:
+                            continue
                         cell_str = _cell_to_str(cell)
                         if not cell_str:
                             continue
