@@ -238,46 +238,30 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
 
 
 # ---------------------------------------------------------
-# ฟังก์ชันดึงจำนวนแถวทั้งหมดใน Sheet
+# ฟังก์ชันล้างข้อมูลทุกคอลัมน์ใน Sheet ทั้งหมด (Batch Clear)
 # ---------------------------------------------------------
-def get_sheet_total_rows(spreadsheet_token, sheet_id, token):
-    url = f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        res = requests.get(url, headers=headers).json()
-        grid_properties = res.get("data", {}).get("sheet", {}).get("grid_properties", {})
-        return grid_properties.get("row_count", 0)
-    except Exception:
-        return 0
+def clear_all_sheet_columns(spreadsheet_token, sheet_ids_dict, token):
+    """ล้างค่าเซลล์ทุกคอลัมน์ใน Sheet ทั้ง 2 แผ่น เริ่มจากแถว 2 (เก็บ header ไว้)"""
+    ranges = []
+    for sheet_name, sheet_id in sheet_ids_dict.items():
+        if sheet_name == BRANCH_CODE_SHEET:
+            ranges.append(f"{sheet_id}!A2:H10000")  # ยิงส่ง: col A-H
+        else:
+            ranges.append(f"{sheet_id}!A2:F10000")  # ยิงถึง: col A-F
 
-
-# ---------------------------------------------------------
-# ฟังก์ชันลบแถวทั้งหมดใน Sheet
-# ---------------------------------------------------------
-def delete_all_sheet_rows(spreadsheet_token, sheet_id, token):
-    total_rows = get_sheet_total_rows(spreadsheet_token, sheet_id, token)
-    if total_rows <= 1:
-        return True  # ไม่มีข้อมูลให้ลบ
-
-    # Feishu ต้องการให้เหลืออย่างน้อย 1 แถว → ลบจาก index 0 ถึง total_rows-1
-    url = f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}/dimension_range"
+    url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_batch_clear"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "dimension": {
-            "sheetId": sheet_id,
-            "majorDimension": "ROWS",
-            "startIndex": 0,
-            "endIndex": total_rows - 1
-        }
-    }
+    payload = {"ranges": ranges}
     try:
         res = requests.delete(url, headers=headers, json=payload).json()
-        return res.get("code", -1) == 0
-    except Exception:
-        return False
+        if res.get("code", -1) == 0:
+            return True, ""
+        return False, f"code={res.get('code')} msg={res.get('msg', '?')}"
+    except Exception as e:
+        return False, str(e)
 
 
 # ---------------------------------------------------------
@@ -370,10 +354,7 @@ def process_event(data):
                         reply_message(message_id, "❌ ไม่พบ Sheet ปลายทาง", token)
                         return
 
-                    results = []
-                    for sheet_name, sheet_id in _sheet_ids.items():
-                        success = delete_all_sheet_rows(_spreadsheet_token, sheet_id, token)
-                        results.append((sheet_name, success))
+                    ok, err = clear_all_sheet_columns(_spreadsheet_token, _sheet_ids, token)
 
                     # รีเซ็ตตัวนับรายวัน
                     app_state["current_date"] = ""
@@ -381,15 +362,10 @@ def process_event(data):
                     app_state["branch_summary"] = {}
                     save_state()
 
-                    success_sheets = [name for name, ok in results if ok]
-                    fail_sheets = [name for name, ok in results if not ok]
-
-                    msg = "🗑️ ลบข้อมูลทั้งหมดเรียบร้อยแล้วครับ\n"
-                    if success_sheets:
-                        msg += f"✅ {', '.join(success_sheets)}\n"
-                    if fail_sheets:
-                        msg += f"❌ ล้มเหลว: {', '.join(fail_sheets)}\n"
-                    msg += "รีเซ็ตยอดรายวันเป็น 0 แล้ว"
+                    if ok:
+                        msg = "🗑️ ล้างข้อมูลทุกคอลัมน์เรียบร้อยแล้วครับ\n✅ ยิงส่ง - ITCBI, ยิงถึง - ITCBI\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
+                    else:
+                        msg = f"❌ ล้างข้อมูลไม่สำเร็จ: {err}\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
 
                     reply_message(message_id, msg, token)
 
