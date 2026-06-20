@@ -256,10 +256,17 @@ def clear_all_sheet_columns(spreadsheet_token, sheet_ids_dict, token):
     }
     payload = {"ranges": ranges}
     try:
-        res = requests.delete(url, headers=headers, json=payload).json()
-        if res.get("code", -1) == 0:
-            return True, ""
-        return False, f"code={res.get('code')} msg={res.get('msg', '?')}"
+        res = requests.delete(url, headers=headers, json=payload)
+        # Feishu บางครั้งคืน response ที่ไม่ใช่ JSON → เช็ค status code ก่อน
+        try:
+            data = res.json()
+            if data.get("code", -1) == 0:
+                return True, ""
+            return False, f"code={data.get('code')} msg={data.get('msg', '?')}"
+        except ValueError:
+            if res.status_code in (200, 204):
+                return True, ""
+            return False, f"HTTP {res.status_code}: {res.text[:200]}"
     except Exception as e:
         return False, str(e)
 
