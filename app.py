@@ -1,805 +1,419 @@
-import os
-import json
-import re
-import unicodedata
-import requests
-import threading
-from flask import Flask, request, jsonify
-from io import BytesIO
-from datetime import datetime, timezone, timedelta
-from openpyxl import load_workbook
+# -*- coding: utf-8 -*-
+"""
+input_data.py
+-------------
+ระบบดึงข้อมูลจาก Feishu Sheet แล้วคีย์เข้า PDA ผ่าน ADB
+**ไม่มีระบบตรวจจับ popup ใดๆ ทั้งสิ้น** เพื่อให้คีย์ข้อมูลได้เร็วที่สุด
 
-app = Flask(__name__)
+การตรวจ popup เป็นหน้าที่ของ recheck.py (รันแยก process)
+input_data.py แค่ "ฟังสัญญาณ" จาก recheck.py ผ่านไฟล์สัญญาณใน common.py:
+  - ถ้าได้สัญญาณ PAUSE  -> หยุดคีย์ทันที รอคำสั่งต่อ
+  - RESUME:CLEAR_DELIVERY -> ลบช่อง delivery แล้วคีย์ A ตัวถัดไปในกลุ่มเดิม
+  - RESUME:SKIP_GROUP     -> ข้ามทั้งกลุ่มงานนี้ ไปขึ้นกลุ่มใหม่
 
-# ---------------------------------------------------------
-# ป้องกัน Feishu ส่ง Event ซ้ำ (Deduplication)
-# ---------------------------------------------------------
-processed_event_ids = set()
-processed_event_lock = threading.Lock()
+รันผ่าน command line:
+    python input_data.py
+หรือใส่ session cookie ใน env var FEISHU_SESSION
+"""
+import sys
+import time
+import datetime
+import io
+from pathlib import Path
 
-# ---------------------------------------------------------
-# ตั้งค่า App ID และ App Secret ของ Feishu
-# ---------------------------------------------------------
-APP_ID = "cli_aabfaea8b0619bfc"
-APP_SECRET = "3emUt5KWwH01BlhIKADP2bCb5C062oxt"
+# บังคับให้ stdout/stderr เป็น UTF-8 กันภาษาไทยเพี้ยน/error บน Windows cmd
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    # สำหรับ Python เก่าที่ไม่มี reconfigure
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-# ---------------------------------------------------------
-# ตั้งค่า Feishu Wiki Spreadsheet ปลายทาง
-# ---------------------------------------------------------
-WIKI_TOKEN = "UbCZwapNyiN15YkEKADcFyUHnWf"
-TARGET_SHEET_NAMES = ["ยิงส่ง - ITCBI", "ยิงถึง - ITCBI"]
-BRANCH_CODE_SHEET = "ยิงส่ง - ITCBI"
-
-# ---------------------------------------------------------
-# Bangkok Timezone (UTC+7)
-# ---------------------------------------------------------
-BKK_TZ = timezone(timedelta(hours=7))
-
-# ---------------------------------------------------------
-# ระบบเก็บ State จำนวน AWB แบบรายวัน และ รหัสสาขา
-# ---------------------------------------------------------
-STATE_FILE = "state.json"
-app_state = {
-    "current_date": "",
-    "daily_count": 0,
-    "branch_summary": {}
-}
-
-# โหลดข้อมูลเก่าถ้ามี
-if os.path.exists(STATE_FILE):
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            app_state = json.load(f)
-    except:
-        pass
-
-def save_state():
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(app_state, f, ensure_ascii=False)
-    except:
-        pass
-
-def add_to_daily_count(new_count, branch_list):
-    tz = timezone(timedelta(hours=7))
-    now = datetime.now(tz)
-    today_str = now.strftime("%d/%m/%Y")
-    
-    # ถ้าระบบข้ามวันแล้ว ให้รีเซ็ตตัวนับและสรุปยอดเป็น 0
-    if app_state.get("current_date") != today_str:
-        app_state["current_date"] = today_str
-        app_state["daily_count"] = 0
-        app_state["branch_summary"] = {}
-        
-    app_state["daily_count"] += new_count
-    
-    # นับยอดแต่ละรหัสสาขา
-    for br in branch_list:
-        if br:
-            app_state["branch_summary"][br] = app_state["branch_summary"].get(br, 0) + 1
-            
-    save_state()
-    return app_state["daily_count"], today_str
+from common import (
+    COORDS,
+    STATE_FILE, CMD_FILE, STOP_FILE, SCAN_COUNTER_FILE,
+    write_signal, read_signal, clear_signal,
+    adb_tap, adb_clear_field, adb_broadcast_text,
+    run_cmd, read_feishu_rows, FEISHU_SHEET_URL, ADB_PATH,
+)
+from upload_notify import upload_to_cloudinary, send_dingtalk_links
 
 
-# ---------------------------------------------------------
-# ฟังก์ชันขอ Token จาก Feishu
-# ---------------------------------------------------------
-def get_tenant_access_token():
-    """ขอ Tenant Access Token จาก Feishu Open API"""
-    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    payload = {"app_id": APP_ID, "app_secret": APP_SECRET}
-    res = requests.post(url, json=payload).json()
-    return res.get("tenant_access_token")
+def log(msg):
+    """พิมพ์ log ออกหน้าจอ command line พร้อม timestamp"""
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
-# ---------------------------------------------------------
-# ฟังก์ชันดาวน์โหลดไฟล์จากแชท Feishu
-# ---------------------------------------------------------
-def download_feishu_file(message_id, file_key, token):
-    """ดาวน์โหลดไฟล์ที่ผู้ใช้ส่งมาในแชท โดยใช้ message_id และ file_key"""
-    url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
-    headers = {"Authorization": f"Bearer {token}"}
-    res = requests.get(url, headers=headers)
-    if res.status_code == 200:
-        return res.content
-    return None
+# =========================================================
+# ปรับความเร็วตรงนี้ได้ง่ายๆ (หน่วยเป็นวินาที)
+# DELAY_AFTER_CONFIRM = เวลารอให้แอป PDA ประมวลผลหลังกดยืนยัน
+#   - ค่าน้อย = เร็วขึ้น แต่ถ้าน้อยไปแอปอาจรับเลขถัดไปไม่ทัน (ช่องไม่ทันเคลียร์)
+#   - ลองไล่จาก 0.15 -> 0.10 -> 0.08 ถ้า PDA ยังตามทัน
+#   - ถ้าเริ่มมีเลขตกหล่น/คีย์ทับ ให้เพิ่มกลับขึ้น
+# =========================================================
+DELAY_AFTER_CONFIRM = 0.25
 
 
-# ---------------------------------------------------------
-# ฟังก์ชันดึงข้อมูลจากไฟล์ Excel
-# ---------------------------------------------------------
-def _cell_to_str(cell):
-    if cell is None:
+class InputDataRunner:
+    def __init__(self):
+        self.running = True
+        # เคลียร์สัญญาณเก่าทิ้งก่อนเริ่ม
+        clear_signal(CMD_FILE)
+        clear_signal(STOP_FILE)
+        write_signal(STATE_FILE, "IDLE")
+
+    # -----------------------------------------------------
+    # ตรวจสอบว่าควรหยุดทั้งระบบหรือยัง (กด stop)
+    # -----------------------------------------------------
+    def should_stop(self) -> bool:
+        if STOP_FILE.exists():
+            self.running = False
+            return True
+        return False
+
+    # -----------------------------------------------------
+    # คอยจังหวะที่ recheck.py สั่ง PAUSE
+    # คืนค่า action ที่ recheck สั่งมา: "CLEAR_DELIVERY" / "SKIP_GROUP" / "" (ไม่มี popup)
+    # -----------------------------------------------------
+    def check_pause(self) -> str:
+        """
+        อ่านคำสั่งจาก recheck.py
+        - ถ้าเป็น PAUSE: รอจนกว่า recheck จะปิด popup เสร็จและส่ง RESUME:<action> กลับมา
+        - คืน action string ให้ลูปหลักจัดการต่อ
+        - ถ้าไม่มีคำสั่ง: คืน "" (ทำงานปกติ)
+        """
+        cmd = read_signal(CMD_FILE)
+        if not cmd:
+            return ""
+
+        if cmd == "PAUSE":
+            log("   ⏸️  ได้รับสัญญาณ PAUSE จาก recheck.py — หยุดรอ recheck ปิด popup...")
+            write_signal(STATE_FILE, "PAUSED")
+
+            # รอ recheck ปิด popup เสร็จ แล้วเปลี่ยนคำสั่งเป็น RESUME:<action>
+            while self.running:
+                if self.should_stop():
+                    return ""
+                cur = read_signal(CMD_FILE)
+                if cur.startswith("RESUME:"):
+                    action = cur.split(":", 1)[1].strip()
+                    clear_signal(CMD_FILE)  # เคลียร์คำสั่งทิ้ง พร้อมรับรอบใหม่
+                    write_signal(STATE_FILE, "RUNNING")
+                    log(f"   ▶️  recheck ปิด popup เสร็จ -> สั่งให้ทำต่อแบบ: {action}")
+                    return action
+                time.sleep(0.1)
+            return ""
+
+        # เผื่อกรณีมี RESUME ค้างอยู่โดยไม่ได้ PAUSE ก่อน -> เคลียร์ทิ้ง
+        if cmd.startswith("RESUME:"):
+            action = cmd.split(":", 1)[1].strip()
+            clear_signal(CMD_FILE)
+            return action
+
         return ""
-    if isinstance(cell, float) and cell == int(cell):
-        return str(int(cell))
-    return str(cell).strip()
 
-def _normalize(text):
-    """Normalize Unicode + ลบ whitespace เพื่อเปรียบเทียบ header ภาษาไทยได้แม่นยำ"""
-    return unicodedata.normalize("NFC", "".join(text.split()))
+    # -----------------------------------------------------
+    # ลบข้อมูลเก่าในช่อง delivery (วิธีเดิมจาก src.py)
+    # -----------------------------------------------------
+    def clear_delivery_field(self):
+        log("   🧹 ลบข้อมูลเก่าในช่อง delivery (วิธีเดิม src.py)")
+        adb_tap(*COORDS["delivery_no"])
+        time.sleep(0.05)
+        adb_clear_field()
+        time.sleep(0.05)
 
-def extract_data_from_excel(file_bytes):
-    try:
-        wb = load_workbook(filename=BytesIO(file_bytes), data_only=True, read_only=True)
-        awb_list = []
-        branch_codes = []
+    # -----------------------------------------------------
+    # คีย์ F + G (เปิดกลุ่มงานใหม่) = STEP 1
+    # -----------------------------------------------------
+    def key_group_header(self, f_data, g_data):
+        # พิมพ์ F และ G แค่ครั้งเดียวต่อ 1 กลุ่ม  (เหมือน src.py)
+        if f_data:
+            adb_tap(*COORDS["open_input"])
+            time.sleep(0.9)
+            adb_tap(*COORDS["station_next"])
+            time.sleep(0.4)
+            adb_broadcast_text(f_data)
+            time.sleep(0.4)
+            adb_tap(*COORDS["db_suggestion"])
+            time.sleep(0.2)
+            adb_tap(*COORDS["select_branch"])
+            time.sleep(0.2)
 
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            all_rows = list(ws.iter_rows(values_only=True))
-            if not all_rows:
-                continue
+        if g_data:
+            adb_tap(*COORDS["task_code"])
+            time.sleep(0.01)
+            adb_clear_field()
+            time.sleep(0.01)
+            adb_broadcast_text(g_data)
+            time.sleep(0.01)
 
-            # === ค้นหา header "สาขาที่ถูกต้อง" ใน 5 แถวแรก ===
-            TARGET = _normalize("สาขาที่ถูกต้อง")
-            correct_branch_col = None
-            awb_col = None
-            data_start_row = 0
+    # -----------------------------------------------------
+    # คีย์เลขพัสดุ (คอลัมน์ A) + กดยืนยัน แบบ Fast Combo
+    # tap -> ADB_CLEAR_TEXT -> ADB_INPUT_TEXT -> tap confirm  รวบเป็น shell เดียว
+    # -----------------------------------------------------
+    def key_delivery(self, a_data):
+        if a_data:
+            t0 = time.time()
+            safe_text = str(a_data).strip()
+            dx, dy = COORDS["delivery_no"]
+            cx, cy = COORDS["confirm_btn"]
+            cmd = (
+                f"input tap {int(dx)} {int(dy)} && "
+                f"am broadcast -a ADB_CLEAR_TEXT && "
+                f"am broadcast -a ADB_INPUT_TEXT --es msg '{safe_text}' && "
+                f"input tap {int(cx)} {int(cy)}"
+            )
+            run_cmd([ADB_PATH, "shell", cmd])
+            time.sleep(DELAY_AFTER_CONFIRM)
+            elapsed = time.time() - t0
+            log(f"   ⚡ ป้อน+ยืนยัน {elapsed:.2f}s")
 
-            for row_idx, row in enumerate(all_rows[:5]):
-                if not row:
+    # -----------------------------------------------------
+    # ลูปการทำงานหลัก
+    # -----------------------------------------------------
+    def run(self):
+        try:
+            rows = read_feishu_rows()
+            total = len(rows)
+            log(f"พบข้อมูลทั้งหมด {total} แถว")
+
+            # -------- จัดกลุ่มข้อมูลตาม F และ G (เหมือน src.py) --------
+            grouped_data = {}
+            skipped_rows = []
+            for row in rows:
+                g = row["G"]
+                if not g or not g.upper().startswith("ZXZB"):
+                    skipped_rows.append(row["A"])
                     continue
-                for i, cell in enumerate(row):
-                    h = _normalize(_cell_to_str(cell))
-                    if TARGET in h:
-                        correct_branch_col = i
-                    if h.upper() == "AWB":
-                        awb_col = i
-                if correct_branch_col is not None:
-                    data_start_row = row_idx + 1
+                key = (row["F"], row["G"])
+                grouped_data.setdefault(key, []).append(row["A"])
+
+            if skipped_rows:
+                log(f"⚠️  ข้าม {len(skipped_rows)} แถวที่ไม่มีเลขงาน (G ไม่พบ/0): "
+                    f"{', '.join(str(x) for x in skipped_rows[:5])}"
+                    f"{'...' if len(skipped_rows) > 5 else ''}")
+            log(f"จัดกลุ่มได้ทั้งหมด {len(grouped_data)} กลุ่มคำสั่งงาน\n")
+            write_signal(STATE_FILE, "RUNNING")
+
+            idx = 0
+            # -------- วนทีละกลุ่ม --------
+            for (f_data, g_data), a_list in grouped_data.items():
+                if self.should_stop():
                     break
 
-            if correct_branch_col is not None:
-                # โหมดพิเศษ: จับคู่ AWB กับสาขาที่ถูกต้องตามคอลัมน์
-                for row in all_rows[data_start_row:]:
-                    if not row:
+                log("=====================================")
+                log(f"📌 [เริ่มกลุ่มใหม่] สาขา: {f_data} | เลขงาน: {g_data}")
+                log(f"   (มีรายการที่ต้องคีย์ทั้งหมด {len(a_list)} รายการ)")
+                log("=====================================")
+
+                # ก่อนขึ้นกลุ่มใหม่ เช็คว่ามี popup ค้างจากแถวก่อนหน้าไหม (non-blocking)
+                pre = self.peek_recheck()
+                if pre == "SKIP_GROUP":
+                    log("   Popup -> skip group before step1")
+                    self.clear_delivery_field()
+                    continue
+                elif pre == "CLEAR_DELIVERY":
+                    log("   🧹 เคลียร์ popup ค้างก่อนขึ้นกลุ่มใหม่เรียบร้อย")
+                    self.clear_delivery_field()
+
+                # STEP 1: เปิดกลุ่มงานใหม่
+                self.key_group_header(f_data, g_data)
+
+                # หลัง STEP 1 ตรวจ popup (non-blocking)
+                step1_action = self.peek_recheck()
+                if step1_action == "SKIP_GROUP":
+                    log(f"   ⏭️ popup หลัง STEP 1 -> ข้ามกลุ่ม {g_data} ไปกลุ่มถัดไป")
+                    continue
+
+                skip_group = False  # ธงสำหรับ popup 2 (ปิดตู้ ห้ามทำซ้ำ)
+
+                # -------- วนคีย์ A ในกลุ่มนี้ --------
+                i = 0
+                while i < len(a_list):
+                    if self.should_stop():
+                        break
+
+                    a_data = a_list[i]
+                    idx += 1
+                    log(f"\n   -> แถวที่ {idx}/{total} | เลขพัสดุ: {a_data}")
+
+                    # เช็ค PAUSE ก่อนเริ่มคีย์ กันกรณี recheck เพิ่งเจอ popup ของแถวก่อน
+                    # (popup อาจยังค้างบนจอ ถ้าคีย์ทับจะพลาด)
+                    pre_action = self.peek_recheck()
+                    if pre_action == "SKIP_GROUP":
+                        log(f"   ⏭️ popup 'ปิดตู้แล้ว' -> ข้ามทั้งกลุ่มงาน {g_data}")
+                        skip_group = True
+                        break
+                    elif pre_action == "CLEAR_DELIVERY":
+                        # recheck ลบ delivery ให้แล้ว คีย์ A ตัวนี้ต่อได้เลย (ไม่ +i ไม่ข้าม)
+                        log("   🔁 popup จัดการแล้ว -> คีย์เลขพัสดุตัวนี้ต่อ")
+
+                    # คีย์ A + กดยืนยัน (Fast Combo) — คีย์รัวไม่รอ
+                    self.key_delivery(a_data)
+
+                    # โหมดเร็วสุด: เช็ค PAUSE แบบแวบเดียว (non-blocking) ไม่หน่วงเลย
+                    # ถ้า recheck เจอ popup มันจะ PAUSE ค้างไว้ -> เราจับได้ที่นี่
+                    # หรือถ้าจับไม่ทันแถวนี้ ก็จะไปจับที่ pre_action ของแถวถัดไป
+                    # (recheck วิ่งตรวจตลอดเวลาอยู่แล้ว ไม่พลาด popup แน่นอน)
+                    action = self.peek_recheck()
+
+                    if action == "SKIP_GROUP":
+                        # popup 2: ข้ามทั้งกลุ่ม ไปขึ้นกลุ่มใหม่เลย
+                        log(f"   ⏭️ popup 'ปิดตู้แล้ว' -> ข้ามทั้งกลุ่มงาน {g_data}")
+                        skip_group = True
+                        break
+
+                    elif action == "CLEAR_DELIVERY":
+                        # popup 1 หรือ 3: recheck ปิด popup + ลบ delivery ให้แล้ว
+                        # คีย์ A ตัวถัดไปในกลุ่มเดิม
+                        log(f"   ⏭️ ข้ามแถวที่ {idx} (popup) -> ไปเลขพัสดุตัวถัดไป")
+                        i += 1
                         continue
 
-                    awb_str = ""
-                    if awb_col is not None and awb_col < len(row):
-                        candidate = _cell_to_str(row[awb_col])
-                        if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
-                            awb_str = candidate
+                    else:
+                        log("   ✓ เสร็จสมบูรณ์")
+                        i += 1
 
-                    if not awb_str:
-                        for j, cell in enumerate(row):
-                            if j == correct_branch_col:
-                                continue
-                            candidate = _cell_to_str(cell)
-                            if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
-                                awb_str = candidate
-                                break
+                if skip_group:
+                    continue  # ไปกลุ่มถัดไป
 
-                    if not awb_str:
-                        continue
+            log("\n====== อัปโหลดเสร็จสิ้น ======")
+            write_signal(STATE_FILE, "DONE")
 
-                    branch_str = ""
-                    if correct_branch_col < len(row):
-                        candidate = _cell_to_str(row[correct_branch_col])
-                        if re.match(r'^\d{6}$', candidate):
-                            branch_str = candidate
+            if self.running:
+                self.take_final_screenshot()
 
-                    awb_list.append(awb_str)
-                    branch_codes.append(branch_str)
-
-                # ลบ AWB ซ้ำ (พร้อม branch ที่จับคู่)
-                seen = set()
-                deduped_awb, deduped_br = [], []
-                for awb, br in zip(awb_list, branch_codes):
-                    if awb not in seen:
-                        seen.add(awb)
-                        deduped_awb.append(awb)
-                        deduped_br.append(br)
-                awb_list, branch_codes = deduped_awb, deduped_br
-
-            else:
-                # โหมดปกติ: ข้ามแถวแรก (header) แล้ว pre-scan หาคอลัมน์ที่ค่า 6 หลักเหมือนกันทุกแถว
-                col_six = {}
-                for row in all_rows[1:]:
-                    if not row:
-                        continue
-                    for j, cell in enumerate(row):
-                        v = _cell_to_str(cell)
-                        if v and re.match(r'^\d{6}$', v):
-                            col_six.setdefault(j, []).append(v)
-
-                # คอลัมน์ที่ทุกค่าเหมือนกัน (เช่น 812087 ทั้งหมด) = สาขาผิด → ข้าม
-                skip_cols = {j for j, vals in col_six.items()
-                             if len(vals) > 1 and len(set(vals)) == 1}
-
-                for row in all_rows[1:]:
-                    if not row:
-                        continue
-                    for j, cell in enumerate(row):
-                        if j in skip_cols:
-                            continue
-                        cell_str = _cell_to_str(cell)
-                        if not cell_str:
-                            continue
-                        if re.match(r'^\d{12}$', cell_str):
-                            awb_list.append(cell_str)
-                        elif re.match(r'^B\d+$', cell_str):
-                            awb_list.append(cell_str)
-                        elif re.match(r'^\d{6}$', cell_str):
-                            branch_codes.append(cell_str)
-
-                # ลบ AWB ซ้ำ
-                seen = set()
-                unique_awb = []
-                for awb in awb_list:
-                    if awb not in seen:
-                        seen.add(awb)
-                        unique_awb.append(awb)
-                awb_list = unique_awb
-
-        wb.close()
-        return awb_list, branch_codes
-
-    except Exception:
-        return [], []
-
-
-# ---------------------------------------------------------
-# ฟังก์ชันดึง Spreadsheet Token จาก Wiki Token
-# ---------------------------------------------------------
-def get_spreadsheet_token(token):
-    """ดึง obj_token (Spreadsheet Token จริง) จาก Wiki Node"""
-    url = f"https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token={WIKI_TOKEN}"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        res = requests.get(url, headers=headers).json()
-        if res.get("code") != 0:
-            return None, f"API Error: {res.get('msg')} (Code: {res.get('code')})"
-        node = res.get("data", {}).get("node", {})
-        return node.get("obj_token"), None
-    except Exception as e:
-        return None, f"Request Error: {str(e)}"
-
-
-# ---------------------------------------------------------
-# ฟังก์ชันดึง Sheet ID ของ Sheet ที่ต้องการ
-# ---------------------------------------------------------
-def get_sheet_ids(spreadsheet_token, token):
-    """ค้นหา Sheet ID ของ Sheet ชื่อ 'ยิงส่ง - ITCBI' และ 'ยิงถึง - ITCBI'"""
-    url = f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/query"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        res = requests.get(url, headers=headers).json()
-        sheets = res.get("data", {}).get("sheets", [])
-
-        sheet_ids = {}
-        for sheet in sheets:
-            title = sheet.get("title", "")
-            sheet_id = sheet.get("sheet_id", "")
-            if title in TARGET_SHEET_NAMES:
-                sheet_ids[title] = sheet_id
-
-        return sheet_ids
-    except Exception:
-        return {}
-
-
-# ---------------------------------------------------------
-# ฟังก์ชันเพิ่มข้อมูลลงใน Feishu Spreadsheet
-# ---------------------------------------------------------
-def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token,
-                           insert_mode="INSERT_ROWS"):
-    url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_append"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    # None → null ใน JSON เพื่อไม่ทับเซลล์ที่มีสูตร
-    if len(values) > 0 and isinstance(values[0], list):
-        sheet_values = [
-            [None if item is None else str(item) for item in row]
-            for row in values
-        ]
-        max_cols = max(len(row) for row in sheet_values)
-        end_col = chr(ord(start_col.upper()) + max_cols - 1)
-        range_str = f"{sheet_id}!{start_col}:{end_col}"
-    else:
-        sheet_values = [[None if v is None else str(v)] for v in values]
-        range_str = f"{sheet_id}!{start_col}:{start_col}"
-
-    payload = {"valueRange": {"range": range_str, "values": sheet_values}}
-    params = {"insertDataOption": insert_mode}
-
-    try:
-        res = requests.post(url, headers=headers, json=payload, params=params).json()
-        return res
-    except Exception as e:
-        return {"code": -1, "msg": str(e)}
-
-
-# ---------------------------------------------------------
-# เขียนข้อมูลลง ยิงส่ง - ITCBI โดยไม่แตะคอลัมน์ G เลย
-# (ค้นหาแถวว่าง → PUT เฉพาะ A, F, H)
-# ---------------------------------------------------------
-def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timestamp, token):
-    api_headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    put_url = (
-        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-        f"{spreadsheet_token}/values"
-    )
-
-    # 1. หาแถวถัดไปที่ว่าง (อ่าน A2:A5000)
-    read_url = (
-        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-        f"{spreadsheet_token}/values/{sheet_id}!A2:A5000"
-    )
-    next_row = 2
-    try:
-        raw = (
-            requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
-            .json()
-            .get("data", {}).get("valueRange", {}).get("values") or []
-        )
-        last_idx = -1
-        for i, row in enumerate(raw):
-            if row and row[0] not in (None, "", "None"):
-                last_idx = i
-        if last_idx >= 0:
-            next_row = last_idx + 3  # raw[i]=A(i+2), แถวถัดไป = A(i+3)
-    except Exception:
-        pass
-
-    n = len(awb_list)
-    if n == 0:
-        return {"code": 0}
-    end_row = next_row + n - 1
-
-    # 2. PUT เฉพาะ A (AWB), F (สาขา), H (เวลา) — ไม่แตะ B C D E G
-    errors = []
-
-    res_a = requests.put(put_url, headers=api_headers, json={
-        "valueRange": {
-            "range": f"{sheet_id}!A{next_row}:A{end_row}",
-            "values": [[awb] for awb in awb_list]
-        }
-    })
-    try:
-        d = res_a.json()
-        if d.get("code", -1) != 0:
-            errors.append(f"A: {d.get('msg')}")
-    except Exception:
-        pass
-
-    f_values = []
-    for i in range(n):
-        br = branch_codes[i] if branch_codes and i < len(branch_codes) else ""
-        f_values.append([br])
-    res_f = requests.put(put_url, headers=api_headers, json={
-        "valueRange": {
-            "range": f"{sheet_id}!F{next_row}:F{end_row}",
-            "values": f_values
-        }
-    })
-    try:
-        d = res_f.json()
-        if d.get("code", -1) != 0:
-            errors.append(f"F: {d.get('msg')}")
-    except Exception:
-        pass
-
-    res_h = requests.put(put_url, headers=api_headers, json={
-        "valueRange": {
-            "range": f"{sheet_id}!H{next_row}:H{end_row}",
-            "values": [[timestamp]] * n
-        }
-    })
-    try:
-        d = res_h.json()
-        if d.get("code", -1) != 0:
-            errors.append(f"H: {d.get('msg')}")
-    except Exception:
-        pass
-
-    if errors:
-        return {"code": -1, "msg": " | ".join(errors)}
-    return {"code": 0}
-
-
-# ---------------------------------------------------------
-# ฟังก์ชันล้างข้อมูลทุกแถวใน Sheet (ลบแถวจริง ไม่ใช่แค่ล้าง)
-# ---------------------------------------------------------
-def clear_all_sheet_columns(spreadsheet_token, sheet_ids_dict, token):
-    auth_headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    errors = []
-
-    for sheet_name, sheet_id in sheet_ids_dict.items():
-        # 1. อ่านคอลัมน์ A เพื่อหาแถวสุดท้ายที่มีข้อมูล
-        read_url = (
-            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-            f"{spreadsheet_token}/values/{sheet_id}!A2:A5000"
-        )
-        last_data_row = 0
-        try:
-            read_res = requests.get(
-                read_url, headers={"Authorization": f"Bearer {token}"}
-            ).json()
-            raw = read_res.get("data", {}).get("valueRange", {}).get("values") or []
-            for i, row in enumerate(raw):
-                if row and row[0] not in (None, "", "None"):
-                    last_data_row = i + 1  # relative index (1-based from row 2)
-        except Exception:
-            last_data_row = 0
-
-        if last_data_row == 0:
-            continue
-
-        # 2. ลบแถวด้วย DELETE /dimension_range
-        # startIndex=1 = row 2 (0-based), endIndex=last_data_row+1 (exclusive)
-        delete_url = (
-            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-            f"{spreadsheet_token}/dimension_range"
-        )
-        payload = {
-            "dimension": {
-                "sheetId": sheet_id,
-                "majorDimension": "ROWS",
-                "startIndex": 2,               # 1-based: row 2 = แถวข้อมูลแรก (ข้ามหัวข้อ)
-                "endIndex": last_data_row + 2  # exclusive, 1-based
-            }
-        }
-        try:
-            res = requests.delete(delete_url, headers=auth_headers, json=payload)
-            try:
-                data = res.json()
-                if data.get("code", -1) != 0:
-                    errors.append(
-                        f"{sheet_name}: code={data.get('code')} msg={data.get('msg', '?')}"
-                    )
-            except ValueError:
-                if res.status_code not in (200, 204):
-                    errors.append(f"{sheet_name}: HTTP {res.status_code}")
+        except ValueError as ve:
+            log(f"❌ เกิดข้อผิดพลาด: {ve}")
+            write_signal(STATE_FILE, "ERROR")
         except Exception as e:
-            errors.append(f"{sheet_name}: {str(e)}")
+            log(f"❌ เกิดข้อผิดพลาดที่ไม่คาดคิด: {e}")
+            write_signal(STATE_FILE, "ERROR")
+        finally:
+            self.running = False
+            write_signal(STATE_FILE, "DONE")
 
-    if errors:
-        return False, " | ".join(errors)
-    return True, ""
+    # -----------------------------------------------------
+    # เช็คสัญญาณ PAUSE จาก recheck.py แบบ "แวบเดียว" (non-blocking)
+    # ไม่หน่วงเวลาเลยถ้าไม่มี popup -> นี่คือกุญแจความเร็ว
+    #
+    # - ถ้า recheck สั่ง PAUSE -> เข้า check_pause() รอ recheck ปิด popup
+    #   แล้วคืน action ("CLEAR_DELIVERY"/"SKIP_GROUP")
+    # - ถ้าไม่มี PAUSE -> คืน "" ทันที ไปคีย์แถวถัดไปได้เลย
+    # -----------------------------------------------------
+    def peek_recheck(self) -> str:
+        cmd = read_signal(CMD_FILE)
+        if cmd == "PAUSE":
+            return self.check_pause()
+        return ""
 
+    # -----------------------------------------------------
+    # รอ recheck ตรวจ popup ให้เสร็จก่อนตัดสินว่าแถวนี้สำเร็จ
+    #
+    # หลักการ: อ่านเลข scan counter ของ recheck ก่อน แล้วรอจน recheck
+    # ตรวจหน้าจอเพิ่มอย่างน้อย 2 รอบ (= มั่นใจว่ามันตรวจ "หลังกดยืนยัน" แล้ว)
+    # - ถ้าระหว่างรอ recheck สั่ง PAUSE -> จัดการ popup แล้วคืน action
+    # - ถ้าครบ 2 รอบแล้วไม่มี PAUSE -> ไม่มี popup จริง คืน "" ไปต่อได้
+    #
+    # ใช้เวลาประมาณ POLL_INTERVAL*2 (~0.6 วิ) ต่อแถว ซึ่งจำเป็น
+    # เพื่อความถูกต้อง (กันการขึ้นกลุ่มใหม่ทับ popup)
+    # -----------------------------------------------------
+    def wait_recheck_verdict(self) -> str:
+        start_count = self._read_scan_count()
+        # ต้องการให้ recheck ตรวจเพิ่มอย่างน้อย 1 รอบหลังจุดนี้
+        # (จุดนี้เรียกแค่ตอนขึ้นกลุ่มใหม่/หลัง STEP 1 ไม่ใช่ทุกแถว จึงไม่กระทบความเร็วรวม)
+        need_count = start_count + 1
+        # timeout กันค้าง (เผื่อ recheck ตาย) — สูงสุด ~3 วิ
+        deadline = time.time() + 3.0
 
-# ---------------------------------------------------------
-# ฟังก์ชันตอบกลับข้อความในแชท
-# ---------------------------------------------------------
-def reply_message(message_id, text, token):
-    """ส่งข้อความตอบกลับในแชท Feishu"""
-    url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json; charset=utf-8"
-    }
-    payload = {
-        "msg_type": "text",
-        "content": json.dumps({"text": text})
-    }
-    requests.post(url, headers=headers, json=payload)
+        while time.time() < deadline:
+            if self.should_stop():
+                return ""
 
+            # เจอ PAUSE -> มี popup จัดการเลย
+            cmd = read_signal(CMD_FILE)
+            if cmd == "PAUSE":
+                return self.check_pause()
 
-# ---------------------------------------------------------
-# ฟังก์ชันจัดการ Event แบบ Asynchronous
-# ---------------------------------------------------------
-def process_event(data):
-    """ประมวลผล Event ใน Background Thread เพื่อป้องกัน Feishu Timeout"""
-    if "header" not in data or "event" not in data:
-        return
+            # recheck ตรวจครบรอบแล้วและไม่มี popup -> ปลอดภัย ไปต่อ
+            if self._read_scan_count() >= need_count:
+                return ""
 
-    event_type = data["header"].get("event_type")
+            time.sleep(0.05)
 
-    if event_type == "im.message.receive_v1":
-        message = data["event"].get("message", {})
-        message_type = message.get("message_type")
-        message_id = message.get("message_id")
+        # timeout: เช็ค PAUSE ครั้งสุดท้ายก่อนยอมไปต่อ
+        if read_signal(CMD_FILE) == "PAUSE":
+            return self.check_pause()
+        return ""
 
-        token = get_tenant_access_token()
-        awb_list = []
-        branch_codes = []
-        is_valid_input = False
+    def _read_scan_count(self) -> int:
+        try:
+            return int(read_signal(SCAN_COUNTER_FILE) or "0")
+        except Exception:
+            return 0
 
-        # ---------------------------------------------
-        # 1. กรณีเป็นไฟล์
-        # ---------------------------------------------
-        if message_type == "file":
-            content = json.loads(message.get("content", "{}"))
-            file_key = content.get("file_key")
-            file_name = content.get("file_name", "")
+    def _old_peek_recheck(self) -> str:
+        cmd = read_signal(CMD_FILE)
+        if cmd == "PAUSE":
+            # มี popup! หยุดรอ recheck ปิด popup + ส่ง action กลับ
+            return self.check_pause()
+        return ""
 
-            if file_name.endswith(".xlsx"):
-                is_valid_input = True
-                reply_message(message_id, f"⏳ กำลังประมวลผลไฟล์ '{file_name}'...", token)
+    # -----------------------------------------------------
+    # ถ่ายภาพหน้าจอตอนจบ (คงจาก src.py)
+    # -----------------------------------------------------
+    def take_final_screenshot(self):
+        save_path = None
+        try:
+            log("\n📸 กำลังบันทึกภาพหน้าจอ PDA...")
+            now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            folder_name = f"photo_pda_{now_str}"
 
-                file_bytes = download_feishu_file(message_id, file_key, token)
-                if file_bytes:
-                    awb_list, branch_codes = extract_data_from_excel(file_bytes)
+            base_dir = Path(__file__).parent
+            save_dir = base_dir / folder_name
+            save_dir.mkdir(parents=True, exist_ok=True)
 
-                    # ดึงรหัสสาขาจากชื่อไฟล์ (ถ้าใน Excel ไม่มีรหัสสาขา)
-                    if not branch_codes:
-                        filename_branch_match = re.search(r'(?<!\d)(\d{6})(?!\d)', file_name)
-                        if filename_branch_match:
-                            branch_code_from_name = filename_branch_match.group(1)
-                            if awb_list:
-                                branch_codes = [branch_code_from_name] * len(awb_list)
-                            else:
-                                branch_codes = [branch_code_from_name]
-                else:
-                    reply_message(message_id, "❌ ดาวน์โหลดไฟล์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง", token)
-                    return
-            else:
-                reply_message(message_id, f"⚠️ รองรับเฉพาะไฟล์นามสกุล .xlsx เท่านั้นครับ", token)
-                return
+            save_path = save_dir / f"screenshot_{now_str}.png"
 
-        # ---------------------------------------------
-        # 2. กรณีเป็นข้อความปกติ (พิมพ์เข้ามาในแชท)
-        # ---------------------------------------------
-        elif message_type == "text":
-            content = json.loads(message.get("content", "{}"))
-            text = content.get("text", "")
+            run_cmd([ADB_PATH, "shell", "screencap", "-p", "/sdcard/final_screen.png"])
+            run_cmd([ADB_PATH, "pull", "/sdcard/final_screen.png", str(save_path)])
+            run_cmd([ADB_PATH, "shell", "rm", "/sdcard/final_screen.png"])
 
-            # --- ฟีเจอร์ "ลบข้อมูล" (Clear/Reset) ---
-            clean_text = text.lower()
-            if any(cmd in clean_text for cmd in ["clear", "ลบข้อมูล", "reset"]):
-                try:
-                    _spreadsheet_token, _error = get_spreadsheet_token(token)
-                    if not _spreadsheet_token:
-                        reply_message(message_id, f"❌ ไม่สามารถเข้าถึง Spreadsheet ได้: {_error}", token)
-                        return
+            log(f"✅ บันทึกภาพเสร็จสิ้นที่โฟลเดอร์: {folder_name}")
+        except Exception as e:
+            log(f"❌ เกิดข้อผิดพลาดในการบันทึกภาพ: {e}")
 
-                    _sheet_ids = get_sheet_ids(_spreadsheet_token, token)
-                    if not _sheet_ids:
-                        reply_message(message_id, "❌ ไม่พบ Sheet ปลายทาง", token)
-                        return
-
-                    ok, err = clear_all_sheet_columns(_spreadsheet_token, _sheet_ids, token)
-
-                    # รีเซ็ตตัวนับรายวัน
-                    app_state["current_date"] = ""
-                    app_state["daily_count"] = 0
-                    app_state["branch_summary"] = {}
-                    save_state()
-
-                    if ok:
-                        msg = "🗑️ ล้างข้อมูลทุกคอลัมน์เรียบร้อยแล้วครับ\n✅ ยิงส่ง - ITCBI, ยิงถึง - ITCBI\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
-                    else:
-                        msg = f"❌ ล้างข้อมูลไม่สำเร็จ: {err}\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
-
-                    reply_message(message_id, msg, token)
-
-                except Exception as e:
-                    reply_message(message_id, f"❌ เกิดข้อผิดพลาดในระบบลบข้อมูล: {str(e)}", token)
-
-                return
-
-            # --- ฟีเจอร์ "สรุปยอด" ---
-            if "สรุปยอด" in text:
-                tz = timezone(timedelta(hours=7))
-                today_str = datetime.now(tz).strftime("%d/%m/%Y")
-                
-                if app_state.get("current_date") != today_str:
-                    reply_message(message_id, f"📊 สรุปยอดวันที่ {today_str}\nยังไม่มีข้อมูลในระบบครับ", token)
-                    return
-                
-                summary_text = f"📊 สรุปยอดวันที่ {today_str}\n"
-                summary_text += "━━━━━━━━━━━━━━━━━━━━\n"
-                
-                branch_summary = app_state.get("branch_summary", {})
-                if branch_summary:
-                    # เรียงตามรหัสสาขา
-                    for br in sorted(branch_summary.keys()):
-                        summary_text += f"🏢 สาขา {br} : {branch_summary[br]} รายการ\n"
-                else:
-                    summary_text += "ไม่มีข้อมูลรหัสสาขา\n"
-                    
-                summary_text += "━━━━━━━━━━━━━━━━━━━━\n"
-                summary_text += f"รวมทั้งหมด: {app_state.get('daily_count', 0)} รายการ\n"
-                
-                reply_message(message_id, summary_text, token)
-                return
-
-            # ตรวจพบลูกน้ำ (,) ให้แจ้ง Error และหยุดการทำงานทันที
-            if "," in text:
-                reply_message(
-                    message_id,
-                    f"⚠️ ตรวจพบเครื่องหมาย ( , ) ในข้อความ\nERROR กรุณาลบ , ออกแล้วส่งใหม่ครับ",
-                    token
-                )
-                return
-
-            # ประมวลผลทีละบรรทัด ป้องกันบรรทัดเหลื่อมกัน
-            lines = text.split("\n")
-            current_branch = ""
-            
-            for line in lines:
-                line_awbs = []
-                # ค้นหาเลข 12 หลัก
-                line_awbs.extend(re.findall(r'(?<!\d)\d{12}(?!\d)', line))
-                # ค้นหารหัส B
-                line_awbs.extend(re.findall(r'\bB\d+\b', line))
-                # ค้นหารหัสสาขา 6 หลัก
-                line_branches = re.findall(r'(?<!\d)\d{6}(?!\d)', line)
-
-                if not line_awbs and not line_branches:
-                    continue
-
-                # ลบ AWB ซ้ำในบรรทัดเดียวกัน (แต่เก็บลำดับเดิม)
-                seen = set()
-                line_awbs = [x for x in line_awbs if not (x in seen or seen.add(x))]
-
-                if line_branches:
-                    # ถ้าเจอสาขา ให้จำสาขาล่าสุดเอาไว้เผื่อบรรทัดถัดไปไม่มี
-                    current_branch = line_branches[-1]
-                elif line_awbs:
-                    # มี "ยิงไป/ยิงถึง" แต่ไม่มีรหัส 6 หลัก = ชื่อสาขา → เว้นว่าง
-                    if "ยิงไป" in line or "ยิงถึง" in line:
-                        line_branches = []
-                        current_branch = ""
-                    elif current_branch:
-                        # ไม่มีคำระบุทิศทาง → สืบทอด current_branch จากบรรทัดก่อน
-                        line_branches = [current_branch] * len(line_awbs)
-
-                # ถ้าระบุรหัสสาขามา 1 ตัว แต่มีหลาย AWB ในบรรทัดนี้ ให้เบิ้ลรหัสสาขาให้เท่ากับ AWB
-                if len(line_branches) == 1 and len(line_awbs) > 1:
-                    line_branches = [line_branches[0]] * len(line_awbs)
-
-                # ถ้าบรรทัดนี้มีแค่ "รหัสสาขา" (ไม่มี AWB) เราจะไม่สร้างบรรทัดว่างๆ ใน Sheet! (แค่จำไว้เฉยๆ)
-                if not line_awbs:
-                    continue
-
-                # จับคู่ AWB กับ Branch เข้าด้วยกัน เพื่อป้องกันบรรทัดเหลื่อมข้ามบรรทัด
-                max_len = max(len(line_awbs), len(line_branches))
-                for i in range(max_len):
-                    awb_list.append(line_awbs[i] if i < len(line_awbs) else "")
-                    branch_codes.append(line_branches[i] if i < len(line_branches) else "")
-
-            if awb_list or branch_codes:
-                is_valid_input = True
-                reply_message(message_id, f"⏳ กำลังบันทึกข้อมูลจากข้อความ...", token)
-            else:
-                reply_message(
-                    message_id,
-                    "👋 สวัสดีครับ! ส่งไฟล์ Excel (.xlsx) หรือพิมพ์เลข AWB (12 หลัก), รหัส B, รหัสสาขา (6 หลัก) มาให้ผมได้เลยครับ",
-                    token
-                )
-                return
-
-        # ==========================================
-        # เริ่มกระบวนการเขียนลง Feishu Sheet
-        # ==========================================
-        if not is_valid_input:
+        # ─── อัปโหลด Cloudinary + แจ้งเตือน DingTalk ───────────────
+        if save_path is None or not save_path.exists():
+            log("⚠️  ไม่พบไฟล์ภาพ — ข้ามขั้นตอนอัปโหลด")
             return
 
-        if not awb_list and not branch_codes:
-            reply_message(
-                message_id,
-                "⚠️ ไม่พบข้อมูล AWB (12 หลัก / รหัส B) หรือรหัสสาขา (6 หลัก) เลยครับ",
-                token
+        try:
+            log("\n☁️  กำลังอัปโหลดภาพขึ้น Cloudinary...")
+            image_url = upload_to_cloudinary(save_path, resource_type="image")
+            log(f"✅ อัปโหลดภาพสำเร็จ: {image_url}")
+        except Exception as e:
+            log(f"❌ อัปโหลดภาพล้มเหลว: {e}")
+            return
+
+        try:
+            log("📨 กำลังส่งลิงก์ไปยัง DingTalk...")
+            send_dingtalk_links(
+                image_url=image_url,
+                sheet_url=FEISHU_SHEET_URL,
             )
-            return
-
-        # ดึง Spreadsheet Token จาก Wiki
-        spreadsheet_token, error_msg = get_spreadsheet_token(token)
-
-        if not spreadsheet_token:
-            reply_message(
-                message_id,
-                f"❌ ไม่สามารถเข้าถึง Wiki Spreadsheet ได้\n"
-                f"สาเหตุ: {error_msg}\n"
-                "กรุณาตรวจสอบว่า JIRAYUTBOT มีสิทธิ์เข้าถึง Wiki และ Sheet แล้ว",
-                token
-            )
-            return
-
-        # ดึง Sheet ID
-        sheet_ids = get_sheet_ids(spreadsheet_token, token)
-
-        if not sheet_ids:
-            reply_message(
-                message_id,
-                "❌ ไม่พบ Sheet 'ยิงส่ง - ITCBI' หรือ 'ยิงถึง - ITCBI'\n"
-                "กรุณาตรวจสอบชื่อ Sheet ใน Feishu Spreadsheet",
-                token
-            )
-            return
-
-        results = []
-        today_time_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M:%S")
-
-        for sheet_name, sheet_id in sheet_ids.items():
-            if sheet_name == BRANCH_CODE_SHEET:
-                # "ยิงส่ง - ITCBI": PUT เฉพาะ A, F, H — ไม่แตะ G เลย
-                res = write_song_sheet(
-                    spreadsheet_token, sheet_id,
-                    awb_list, branch_codes, today_time_str, token
-                )
-                if res.get("code", -1) == 0:
-                    results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
-                else:
-                    results.append(f"❌ {sheet_name}: {res.get('msg', 'Unknown error')}")
-            else:
-                # "ยิงถึง - ITCBI": มีแค่ AWB และวันที่
-                if awb_list:
-                    rows = []
-                    for awb in awb_list:
-                        # [Col A,  B,    C,    D,    E,    F            ]
-                        rows.append([awb, None, None, None, None, today_time_str])
-                    res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
-                    code = res.get("code", -1)
-                    if code == 0:
-                        results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
-                    else:
-                        msg = res.get("msg", "Unknown error")
-                        results.append(f"❌ {sheet_name}: {msg}")
-
-        # === อัปเดตตัวนับรายวัน ===
-        total_awb = len(awb_list)
-        daily_total, today_date = add_to_daily_count(total_awb, branch_codes)
-
-        # === สร้างข้อความสรุป ===
-        summary = (
-            f"📅 จำนวน AWB ของไฟล์นี้ : {total_awb}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📅 AWB วันที่ {today_date} รวม {daily_total}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-        )
-
-        # ถ้ามีข้อผิดพลาด ให้แสดงด้วย
-        errors = [msg for msg in results if "❌" in msg]
-        if errors:
-            summary += "\n".join(errors) + "\n━━━━━━━━━━━━━━━━━━━━\n"
-
-        summary += "✅ ประมวลผลเสร็จสิ้น!"
-
-        reply_message(message_id, summary, token)
-
-# ---------------------------------------------------------
-# Webhook Endpoint (รับ Event จาก Feishu)
-# ---------------------------------------------------------
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.json
-
-    # ขั้นตอนที่ 1: ยืนยัน URL Challenge
-    if "challenge" in data:
-        return jsonify({"challenge": data["challenge"]})
-
-    # ขั้นตอนที่ 2: ตรวจสอบ event_id ไม่ให้ประมวลผลซ้ำ
-    event_id = data.get("header", {}).get("event_id")
-    if event_id:
-        with processed_event_lock:
-            if event_id in processed_event_ids:
-                return jsonify({"status": "ok"})
-            processed_event_ids.add(event_id)
-            # เก็บแค่ 1000 event ล่าสุด ป้องกัน memory leak
-            if len(processed_event_ids) > 1000:
-                oldest = next(iter(processed_event_ids))
-                processed_event_ids.discard(oldest)
-
-    # ขั้นตอนที่ 3: รันการประมวลผลใน Background Thread
-    thread = threading.Thread(target=process_event, args=(data,))
-    thread.start()
-
-    # ตอบกลับ Feishu ทันทีว่า "รับทราบแล้ว" เพื่อไม่ให้ Feishu ส่งซ้ำ
-    return jsonify({"status": "ok"})
+            log("✅ ส่งแจ้งเตือน DingTalk สำเร็จ")
+        except Exception as e:
+            log(f"❌ ส่ง DingTalk ล้มเหลว: {e}")
 
 
-# ---------------------------------------------------------
-# Health Check
-# ---------------------------------------------------------
-@app.route("/", methods=["GET"])
-def health():
-    return "JIRAYUTBOT is running! 🤖"
+def main():
+    log("กำลังเชื่อมต่อ Feishu Sheet...")
+    runner = InputDataRunner()
+    runner.run()
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    main()
