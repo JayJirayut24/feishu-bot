@@ -358,8 +358,8 @@ def clear_all_sheet_columns(spreadsheet_token, sheet_ids_dict, token):
             "dimension": {
                 "sheetId": sheet_id,
                 "majorDimension": "ROWS",
-                "startIndex": 1,
-                "endIndex": last_data_row + 1
+                "startIndex": 2,               # 1-based: row 2 = แถวข้อมูลแรก (ข้ามหัวข้อ)
+                "endIndex": last_data_row + 2  # exclusive, 1-based
             }
         }
         try:
