@@ -108,13 +108,15 @@ def download_feishu_file(message_id, file_key, token):
 # ---------------------------------------------------------
 # ฟังก์ชันดึงข้อมูลจากไฟล์ Excel
 # ---------------------------------------------------------
+def _cell_to_str(cell):
+    """แปลงค่า cell เป็น string ตัด .0 ออกถ้าเป็น float"""
+    if cell is None:
+        return ""
+    if isinstance(cell, float) and cell == int(cell):
+        return str(int(cell))
+    return str(cell).strip()
+
 def extract_data_from_excel(file_bytes):
-    """
-    อ่านไฟล์ Excel (.xlsx) และดึงข้อมูล 3 ประเภท:
-    1. เลข AWB 13 หลัก (เช่น 7989935047501)
-    2. รหัส B ตามด้วยตัวเลข (เช่น B28999230)
-    3. รหัสสาขา 6 หลัก (เช่น 811146)
-    """
     try:
         wb = load_workbook(filename=BytesIO(file_bytes), data_only=True, read_only=True)
         awb_list = []
@@ -122,40 +124,91 @@ def extract_data_from_excel(file_bytes):
 
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
-            for row in ws.iter_rows(values_only=True):
-                for cell in row:
-                    if cell is None:
+            all_rows = list(ws.iter_rows(values_only=True))
+            if not all_rows:
+                continue
+
+            # ตรวจหาคอลัมน์ "สาขาที่ถูกต้อง" และ "AWB" ในแถว header
+            header = all_rows[0]
+            correct_branch_col = None
+            awb_col = None
+            for i, cell in enumerate(header):
+                h = _cell_to_str(cell)
+                if "สาขาที่ถูกต้อง" in h:
+                    correct_branch_col = i
+                if h.upper() == "AWB":
+                    awb_col = i
+
+            if correct_branch_col is not None:
+                # โหมดพิเศษ: จับคู่ AWB กับสาขาที่ถูกต้องตามคอลัมน์
+                for row in all_rows[1:]:
+                    if not row:
                         continue
 
-                    # แปลงค่าเซลล์เป็น string
-                    cell_str = str(cell).strip()
+                    # ค้นหา AWB — ใช้คอลัมน์ AWB ก่อน ถ้าไม่มี header ให้ scan ทั้งแถว
+                    awb_str = ""
+                    if awb_col is not None and awb_col < len(row):
+                        candidate = _cell_to_str(row[awb_col])
+                        if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
+                            awb_str = candidate
 
-                    # ถ้าเป็นตัวเลขทศนิยม (เช่น 7989935047501.0) ให้ตัด .0 ออก
-                    if isinstance(cell, float) and cell == int(cell):
-                        cell_str = str(int(cell))
+                    if not awb_str:
+                        for j, cell in enumerate(row):
+                            if j == correct_branch_col:
+                                continue
+                            candidate = _cell_to_str(cell)
+                            if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
+                                awb_str = candidate
+                                break
 
-                    # เงื่อนไข 1: ตัวเลข 12 หลักพอดี → AWB
-                    if re.match(r'^\d{12}$', cell_str):
-                        awb_list.append(cell_str)
-                    # เงื่อนไข 2: ขึ้นต้นด้วย B ตามด้วยตัวเลข → AWB
-                    elif re.match(r'^B\d+$', cell_str):
-                        awb_list.append(cell_str)
-                    # เงื่อนไข 3: ตัวเลข 6 หลักพอดี → รหัสสาขา
-                    elif re.match(r'^\d{6}$', cell_str):
-                        branch_codes.append(cell_str)
+                    if not awb_str:
+                        continue  # แถวนี้ไม่มี AWB → ข้าม
+
+                    # ดึงสาขาที่ถูกต้องจากคอลัมน์ที่กำหนด
+                    branch_str = ""
+                    if correct_branch_col < len(row):
+                        candidate = _cell_to_str(row[correct_branch_col])
+                        if re.match(r'^\d{6}$', candidate):
+                            branch_str = candidate
+
+                    awb_list.append(awb_str)
+                    branch_codes.append(branch_str)
+
+                # ลบ AWB ซ้ำ (พร้อม branch ที่จับคู่)
+                seen = set()
+                deduped_awb, deduped_br = [], []
+                for awb, br in zip(awb_list, branch_codes):
+                    if awb not in seen:
+                        seen.add(awb)
+                        deduped_awb.append(awb)
+                        deduped_br.append(br)
+                awb_list, branch_codes = deduped_awb, deduped_br
+
+            else:
+                # โหมดปกติ: scan ทุก cell หาเลข 12 หลักและ 6 หลัก
+                for row in all_rows:
+                    for cell in row:
+                        cell_str = _cell_to_str(cell)
+                        if not cell_str:
+                            continue
+                        if re.match(r'^\d{12}$', cell_str):
+                            awb_list.append(cell_str)
+                        elif re.match(r'^B\d+$', cell_str):
+                            awb_list.append(cell_str)
+                        elif re.match(r'^\d{6}$', cell_str):
+                            branch_codes.append(cell_str)
+
+                # ลบ AWB ซ้ำ
+                seen = set()
+                unique_awb = []
+                for awb in awb_list:
+                    if awb not in seen:
+                        seen.add(awb)
+                        unique_awb.append(awb)
+                awb_list = unique_awb
 
         wb.close()
-
-        # ลบ AWB ซ้ำ (เก็บลำดับเดิม)
-        seen_awb = set()
-        unique_awb = []
-        for awb in awb_list:
-            if awb not in seen_awb:
-                seen_awb.add(awb)
-                unique_awb.append(awb)
-
-        # รหัสสาขาไม่ลบซ้ำ (เพราะ 1 รหัสสาขาอาจมีหลายพัสดุ)
-        return unique_awb, branch_codes
+        return awb_list, branch_codes
 
     except Exception:
         return [], []
@@ -241,43 +294,42 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
 # ฟังก์ชันล้างข้อมูลทุกคอลัมน์ใน Sheet (เขียนค่าว่างทับ)
 # ---------------------------------------------------------
 def clear_all_sheet_columns(spreadsheet_token, sheet_ids_dict, token):
-    """อ่านจำนวนแถวที่มีข้อมูล แล้วเขียนค่าว่างทับทุก column (เก็บ header row ไว้)"""
     auth_headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
-
     errors = []
 
     for sheet_name, sheet_id in sheet_ids_dict.items():
         col_end = "H" if sheet_name == BRANCH_CODE_SHEET else "F"
         num_cols = 8 if sheet_name == BRANCH_CODE_SHEET else 6
 
-        # 1. อ่านคอลัมน์ A เพื่อนับว่ามีกี่แถวข้อมูล (ข้าม header แถวที่ 1)
-        read_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}!A2:A10000"
+        # 1. อ่านคอลัมน์ A เพื่อนับแถวที่มีข้อมูลจริง (ข้าม null/ว่าง)
+        read_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}!A2:A5000"
         try:
             read_res = requests.get(read_url, headers={"Authorization": f"Bearer {token}"}).json()
-            existing = read_res.get("data", {}).get("valueRange", {}).get("values", [])
-            num_rows = len(existing)
+            raw = read_res.get("data", {}).get("valueRange", {}).get("values") or []
+            num_rows = sum(1 for row in raw if row and row[0] not in (None, "", "None"))
         except Exception:
             num_rows = 0
 
         if num_rows == 0:
-            continue  # ไม่มีข้อมูล ข้ามไป
+            continue
 
-        # 2. เขียนค่าว่างทับทุกแถว (แถว 2 ถึง num_rows+1)
+        # 2. เขียนค่าว่างทับทุกแถว (แถว 2 ถึง num_rows+1) ด้วย values_batch_update
+        last_row = num_rows + 1
         empty_rows = [[""] * num_cols for _ in range(num_rows)]
-        range_str = f"{sheet_id}!A2:{col_end}{num_rows + 1}"
+        range_str = f"{sheet_id}!A2:{col_end}{last_row}"
 
-        put_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values"
-        payload = {"valueRange": {"range": range_str, "values": empty_rows}}
+        put_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_batch_update"
+        payload = {"valueRanges": [{"range": range_str, "values": empty_rows}]}
 
         try:
             res = requests.put(put_url, headers=auth_headers, json=payload)
             try:
                 data = res.json()
                 if data.get("code", -1) != 0:
-                    errors.append(f"{sheet_name}: code={data.get('code')} msg={data.get('msg', '?')}")
+                    errors.append(f"{sheet_name} [range={range_str}]: code={data.get('code')} msg={data.get('msg', '?')}")
             except ValueError:
                 if res.status_code not in (200, 204):
                     errors.append(f"{sheet_name}: HTTP {res.status_code}")
