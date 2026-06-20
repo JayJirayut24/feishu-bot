@@ -11,6 +11,12 @@ from openpyxl import load_workbook
 app = Flask(__name__)
 
 # ---------------------------------------------------------
+# ป้องกัน Feishu ส่ง Event ซ้ำ (Deduplication)
+# ---------------------------------------------------------
+processed_event_ids = set()
+processed_event_lock = threading.Lock()
+
+# ---------------------------------------------------------
 # ตั้งค่า App ID และ App Secret ของ Feishu
 # ---------------------------------------------------------
 APP_ID = "cli_aabfaea8b0619bfc"
@@ -232,6 +238,49 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
 
 
 # ---------------------------------------------------------
+# ฟังก์ชันดึงจำนวนแถวทั้งหมดใน Sheet
+# ---------------------------------------------------------
+def get_sheet_total_rows(spreadsheet_token, sheet_id, token):
+    url = f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        res = requests.get(url, headers=headers).json()
+        grid_properties = res.get("data", {}).get("sheet", {}).get("grid_properties", {})
+        return grid_properties.get("row_count", 0)
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------
+# ฟังก์ชันลบแถวทั้งหมดใน Sheet
+# ---------------------------------------------------------
+def delete_all_sheet_rows(spreadsheet_token, sheet_id, token):
+    total_rows = get_sheet_total_rows(spreadsheet_token, sheet_id, token)
+    if total_rows <= 1:
+        return True  # ไม่มีข้อมูลให้ลบ
+
+    # Feishu ต้องการให้เหลืออย่างน้อย 1 แถว → ลบจาก index 0 ถึง total_rows-1
+    url = f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}/dimension_range"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "dimension": {
+            "sheetId": sheet_id,
+            "majorDimension": "ROWS",
+            "startIndex": 0,
+            "endIndex": total_rows - 1
+        }
+    }
+    try:
+        res = requests.delete(url, headers=headers, json=payload).json()
+        return res.get("code", -1) == 0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------
 # ฟังก์ชันตอบกลับข้อความในแชท
 # ---------------------------------------------------------
 def reply_message(message_id, text, token):
@@ -310,45 +359,43 @@ def process_event(data):
             # --- ฟีเจอร์ "ลบข้อมูล" (Clear/Reset) ---
             clean_text = text.lower()
             if any(cmd in clean_text for cmd in ["clear", "ลบข้อมูล", "reset"]):
-                tz = timezone(timedelta(hours=7))
-                today_str = datetime.now(tz).strftime("%d/%m/%Y")
-                deleted_rows_total = 0
-                
-                for sheet_name, sheet_id in sheet_ids.items():
-                    col = "H" if sheet_name == BRANCH_CODE_SHEET else "F"
-                    values = get_feishu_sheet_column(spreadsheet_token, sheet_id, col, token)
-                    
-                    rows_to_delete = []
-                    for i, row in enumerate(values):
-                        if row and len(row) > 0 and str(row[0]).startswith(today_str):
-                            rows_to_delete.append(i + 1)
-                            
-                    if rows_to_delete:
-                        ranges = []
-                        start_r = rows_to_delete[0]
-                        end_r = rows_to_delete[0]
-                        for r in rows_to_delete[1:]:
-                            if r == end_r + 1:
-                                end_r = r
-                            else:
-                                ranges.append((start_r, end_r))
-                                start_r = r
-                                end_r = r
-                        ranges.append((start_r, end_r))
-                        
-                        # ลบจากล่างขึ้นบน เพื่อไม่ให้ index เพี้ยน
-                        for start_r, end_r in reversed(ranges):
-                            count = end_r - start_r + 1
-                            delete_feishu_sheet_rows(spreadsheet_token, sheet_id, start_r, count, token)
-                            deleted_rows_total += count
+                try:
+                    _spreadsheet_token, _error = get_spreadsheet_token(token)
+                    if not _spreadsheet_token:
+                        reply_message(message_id, f"❌ ไม่สามารถเข้าถึง Spreadsheet ได้: {_error}", token)
+                        return
 
-                # รีเซ็ตตัวนับยอดรายวัน
-                app_state["current_date"] = today_str
-                app_state["daily_count"] = 0
-                app_state["branch_summary"] = {}
-                save_state()
-                
-                reply_message(message_id, f"🗑️ ทำการลบข้อมูลของวันที่ {today_str} ออกจาก Sheet ทั้งหมด {deleted_rows_total} แถว และรีเซ็ตยอดกลับเป็น 0 เรียบร้อยแล้วครับ", token)
+                    _sheet_ids = get_sheet_ids(_spreadsheet_token, token)
+                    if not _sheet_ids:
+                        reply_message(message_id, "❌ ไม่พบ Sheet ปลายทาง", token)
+                        return
+
+                    results = []
+                    for sheet_name, sheet_id in _sheet_ids.items():
+                        success = delete_all_sheet_rows(_spreadsheet_token, sheet_id, token)
+                        results.append((sheet_name, success))
+
+                    # รีเซ็ตตัวนับรายวัน
+                    app_state["current_date"] = ""
+                    app_state["daily_count"] = 0
+                    app_state["branch_summary"] = {}
+                    save_state()
+
+                    success_sheets = [name for name, ok in results if ok]
+                    fail_sheets = [name for name, ok in results if not ok]
+
+                    msg = "🗑️ ลบข้อมูลทั้งหมดเรียบร้อยแล้วครับ\n"
+                    if success_sheets:
+                        msg += f"✅ {', '.join(success_sheets)}\n"
+                    if fail_sheets:
+                        msg += f"❌ ล้มเหลว: {', '.join(fail_sheets)}\n"
+                    msg += "รีเซ็ตยอดรายวันเป็น 0 แล้ว"
+
+                    reply_message(message_id, msg, token)
+
+                except Exception as e:
+                    reply_message(message_id, f"❌ เกิดข้อผิดพลาดในระบบลบข้อมูล: {str(e)}", token)
+
                 return
 
             # --- ฟีเจอร์ "สรุปยอด" ---
@@ -409,9 +456,14 @@ def process_event(data):
                 if line_branches:
                     # ถ้าเจอสาขา ให้จำสาขาล่าสุดเอาไว้เผื่อบรรทัดถัดไปไม่มี
                     current_branch = line_branches[-1]
-                elif line_awbs and current_branch:
-                    # ถ้าบรรทัดนี้มี AWB แต่ไม่มีสาขา ให้เอาสาขาที่จำไว้มาเติมให้
-                    line_branches = [current_branch] * len(line_awbs)
+                elif line_awbs:
+                    # มี "ยิงไป/ยิงถึง" แต่ไม่มีรหัส 6 หลัก = ชื่อสาขา → เว้นว่าง
+                    if "ยิงไป" in line or "ยิงถึง" in line:
+                        line_branches = []
+                        current_branch = ""
+                    elif current_branch:
+                        # ไม่มีคำระบุทิศทาง → สืบทอด current_branch จากบรรทัดก่อน
+                        line_branches = [current_branch] * len(line_awbs)
 
                 # ถ้าระบุรหัสสาขามา 1 ตัว แต่มีหลาย AWB ในบรรทัดนี้ ให้เบิ้ลรหัสสาขาให้เท่ากับ AWB
                 if len(line_branches) == 1 and len(line_awbs) > 1:
@@ -523,7 +575,9 @@ def process_event(data):
 
         # === สร้างข้อความสรุป ===
         summary = (
-            f"📅 จำนวน AWB วันที่ {today_date} รวม {daily_total}\n"
+            f"📅 จำนวน AWB ของไฟล์นี้ : {total_awb}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 AWB วันที่ {today_date} รวม {daily_total}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
         )
 
@@ -547,7 +601,19 @@ def webhook():
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
-    # ขั้นตอนที่ 2: รันการประมวลผลใน Background Thread
+    # ขั้นตอนที่ 2: ตรวจสอบ event_id ไม่ให้ประมวลผลซ้ำ
+    event_id = data.get("header", {}).get("event_id")
+    if event_id:
+        with processed_event_lock:
+            if event_id in processed_event_ids:
+                return jsonify({"status": "ok"})
+            processed_event_ids.add(event_id)
+            # เก็บแค่ 1000 event ล่าสุด ป้องกัน memory leak
+            if len(processed_event_ids) > 1000:
+                oldest = next(iter(processed_event_ids))
+                processed_event_ids.discard(oldest)
+
+    # ขั้นตอนที่ 3: รันการประมวลผลใน Background Thread
     thread = threading.Thread(target=process_event, args=(data,))
     thread.start()
 
