@@ -195,9 +195,19 @@ def extract_data_from_excel(file_bytes):
                 awb_list, branch_codes = deduped_awb, deduped_br
 
             else:
-                # โหมดปกติ: ข้ามแถวแรก (header) แล้ว pre-scan หาคอลัมน์ที่ค่า 6 หลักเหมือนกันทุกแถว
+                # โหมดปกติ: ตรวจแถวแรกก่อนว่าเป็น header หรือข้อมูลจริง
+                start_idx = 0
+                if all_rows:
+                    first_row_cells = [_cell_to_str(c) for c in (all_rows[0] or []) if c is not None]
+                    has_data = any(
+                        re.match(r'^\d{12}$', v) or re.match(r'^B\d+$', v) or re.match(r'^\d{6}$', v)
+                        for v in first_row_cells
+                    )
+                    if not has_data:
+                        start_idx = 1  # แถวแรกเป็นชื่อหัวข้อ → ข้าม
+
                 col_six = {}
-                for row in all_rows[1:]:
+                for row in all_rows[start_idx:]:
                     if not row:
                         continue
                     for j, cell in enumerate(row):
@@ -209,7 +219,7 @@ def extract_data_from_excel(file_bytes):
                 skip_cols = {j for j, vals in col_six.items()
                              if len(vals) > 1 and len(set(vals)) == 1}
 
-                for row in all_rows[1:]:
+                for row in all_rows[start_idx:]:
                     if not row:
                         continue
                     for j, cell in enumerate(row):
