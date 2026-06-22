@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 import unicodedata
 import requests
 import threading
@@ -29,6 +30,7 @@ APP_SECRET = "3emUt5KWwH01BlhIKADP2bCb5C062oxt"
 WIKI_TOKEN = "UbCZwapNyiN15YkEKADcFyUHnWf"
 TARGET_SHEET_NAMES = ["ยิงส่ง - ITCBI", "ยิงถึง - ITCBI"]
 BRANCH_CODE_SHEET = "ยิงส่ง - ITCBI"
+SUMMARY_LOG_SHEET = "สรุปยอดยิงส่ง"
 
 # ---------------------------------------------------------
 # Bangkok Timezone (UTC+7)
@@ -152,7 +154,6 @@ def extract_data_from_excel(file_bytes):
                     break
 
             if correct_branch_col is not None:
-                # โหมดพิเศษ: จับคู่ AWB กับสาขาที่ถูกต้องตามคอลัมน์
                 for row in all_rows[data_start_row:]:
                     if not row:
                         continue
@@ -195,7 +196,6 @@ def extract_data_from_excel(file_bytes):
                 awb_list, branch_codes = deduped_awb, deduped_br
 
             else:
-                # โหมดปกติ: ตรวจแถวแรกก่อนว่าเป็น header หรือข้อมูลจริง
                 start_idx = 0
                 if all_rows:
                     first_row_cells = [_cell_to_str(c) for c in (all_rows[0] or []) if c is not None]
@@ -204,7 +204,7 @@ def extract_data_from_excel(file_bytes):
                         for v in first_row_cells
                     )
                     if not has_data:
-                        start_idx = 1  # แถวแรกเป็นชื่อหัวข้อ → ข้าม
+                        start_idx = 1
 
                 col_six = {}
                 for row in all_rows[start_idx:]:
@@ -235,7 +235,6 @@ def extract_data_from_excel(file_bytes):
                         elif re.match(r'^\d{6}$', cell_str):
                             branch_codes.append(cell_str)
 
-                # ลบ AWB ซ้ำ
                 seen = set()
                 unique_awb = []
                 for awb in awb_list:
@@ -289,6 +288,162 @@ def get_sheet_ids(spreadsheet_token, token):
         return sheet_ids
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------
+# ฟังก์ชันดึง Sheet ID ของ สรุปยอดยิงส่ง
+# ---------------------------------------------------------
+def get_summary_sheet_id(spreadsheet_token, token):
+    url = f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/query"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        res = requests.get(url, headers=headers).json()
+        for sheet in res.get("data", {}).get("sheets", []):
+            if sheet.get("title", "") == SUMMARY_LOG_SHEET:
+                return sheet.get("sheet_id", "")
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------
+# บันทึก/อัปเดต log รายวันลง Sheet สรุปยอดยิงส่ง (upsert)
+# ---------------------------------------------------------
+def save_daily_log(date_str, branch_summary, spreadsheet_token, summary_sheet_id, token):
+    if not branch_summary or not summary_sheet_id:
+        return False
+
+    api_headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    # 1. อ่านข้อมูลที่มีอยู่ใน log sheet
+    read_url = (
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+        f"{spreadsheet_token}/values/{summary_sheet_id}!A2:C5000"
+    )
+    try:
+        raw = (
+            requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
+            .json()
+            .get("data", {}).get("valueRange", {}).get("values") or []
+        )
+    except Exception:
+        raw = []
+
+    # 2. หาแถวที่มี date_str อยู่แล้ว (sheet row number, 1-based)
+    today_row_indices = []
+    for i, row in enumerate(raw):
+        if row and row[0] and str(row[0]).strip() == date_str:
+            today_row_indices.append(i + 2)
+
+    # 3. ลบแถวของวันนี้ก่อน (ถ้ามี) เพื่อ upsert
+    if today_row_indices:
+        delete_url = (
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+            f"{spreadsheet_token}/dimension_range"
+        )
+        payload = {
+            "dimension": {
+                "sheetId": summary_sheet_id,
+                "majorDimension": "ROWS",
+                "startIndex": min(today_row_indices),
+                "endIndex": max(today_row_indices) + 1
+            }
+        }
+        try:
+            requests.delete(delete_url, headers=api_headers, json=payload)
+        except Exception:
+            pass
+
+    # 4. Append แถวใหม่สำหรับแต่ละสาขา
+    rows_to_append = [
+        [date_str, br, count]
+        for br, count in sorted(branch_summary.items())
+    ]
+    append_url = (
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+        f"{spreadsheet_token}/values_append"
+    )
+    payload = {
+        "valueRange": {
+            "range": f"{summary_sheet_id}!A:C",
+            "values": rows_to_append
+        }
+    }
+    try:
+        res = requests.post(
+            append_url, headers=api_headers, json=payload,
+            params={"insertDataOption": "INSERT_ROWS"}
+        ).json()
+        return res.get("code") == 0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------
+# ตัดยอดอัตโนมัติเวลา 00:00 น.
+# ---------------------------------------------------------
+def midnight_daily_cutoff():
+    tz = timezone(timedelta(hours=7))
+    yesterday_str = (datetime.now(tz) - timedelta(days=1)).strftime("%d/%m/%Y")
+    try:
+        token = get_tenant_access_token()
+        if not token:
+            return
+        stoken, _ = get_spreadsheet_token(token)
+        if not stoken:
+            return
+        sids = get_sheet_ids(stoken, token)
+        song_id = sids.get(BRANCH_CODE_SHEET)
+        if not song_id:
+            return
+
+        read_url = (
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+            f"{stoken}/values/{song_id}!A2:H5000"
+        )
+        raw = (
+            requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
+            .json()
+            .get("data", {}).get("valueRange", {}).get("values") or []
+        )
+        branch_summary = {}
+        for row in raw:
+            if not row or not row[0] or str(row[0]).strip() in ("", "None"):
+                continue
+            time_val = str(row[7]).strip() if len(row) > 7 and row[7] else ""
+            if yesterday_str not in time_val:
+                continue
+            br = str(row[5]).strip() if len(row) > 5 and row[5] else ""
+            if br and br not in ("", "None"):
+                branch_summary[br] = branch_summary.get(br, 0) + 1
+
+        if branch_summary:
+            sid = get_summary_sheet_id(stoken, token)
+            if sid:
+                save_daily_log(yesterday_str, branch_summary, stoken, sid, token)
+    except Exception:
+        pass
+
+
+def start_midnight_scheduler():
+    """Background thread ตัดยอดอัตโนมัติทุกเที่ยงคืน (Bangkok time)"""
+    def _loop():
+        while True:
+            tz = timezone(timedelta(hours=7))
+            now = datetime.now(tz)
+            next_midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=5, microsecond=0
+            )
+            time.sleep(max((next_midnight - now).total_seconds(), 1))
+            try:
+                midnight_daily_cutoff()
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------
@@ -590,6 +745,74 @@ def process_event(data):
 
                 return
 
+            # --- ฟีเจอร์ "สรุปเดือน" (สรุปยอดสะสมทั้งเดือนจาก log sheet) ---
+            if "สรุปเดือน" in text:
+                tz = timezone(timedelta(hours=7))
+                now = datetime.now(tz)
+                month_str = now.strftime("%m/%Y")
+
+                stoken, _err = get_spreadsheet_token(token)
+                if not stoken:
+                    reply_message(message_id, f"❌ ไม่สามารถเข้าถึง Sheet ได้: {_err}", token)
+                    return
+
+                sid = get_summary_sheet_id(stoken, token)
+                if not sid:
+                    reply_message(
+                        message_id,
+                        f"❌ ไม่พบ Sheet '{SUMMARY_LOG_SHEET}'\n"
+                        "กรุณาสร้าง Sheet ชื่อนี้ใน Spreadsheet ก่อนครับ",
+                        token
+                    )
+                    return
+
+                read_url = (
+                    f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+                    f"{stoken}/values/{sid}!A2:C5000"
+                )
+                try:
+                    raw = (
+                        requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
+                        .json()
+                        .get("data", {}).get("valueRange", {}).get("values") or []
+                    )
+                except Exception:
+                    raw = []
+
+                monthly_branch = {}
+                for row in raw:
+                    if not row or not row[0]:
+                        continue
+                    parts = str(row[0]).strip().split("/")
+                    if len(parts) == 3 and "/".join(parts[1:]) == month_str:
+                        br = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+                        try:
+                            cnt = int(float(str(row[2]))) if len(row) > 2 and row[2] else 0
+                        except (ValueError, TypeError):
+                            cnt = 0
+                        if br:
+                            monthly_branch[br] = monthly_branch.get(br, 0) + cnt
+
+                thai_months = ["", "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+                               "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+                month_num = int(now.strftime("%m"))
+                year_thai = int(now.strftime("%Y")) + 543
+                month_display = f"{thai_months[month_num]} {year_thai}"
+
+                msg = f"📅 สรุปยอดเดือน {month_display}\n━━━━━━━━━━━━━━━━━━━━\n"
+                if not monthly_branch:
+                    msg += "ยังไม่มีข้อมูลในเดือนนี้ครับ"
+                else:
+                    total = 0
+                    for br in sorted(monthly_branch.keys()):
+                        msg += f"🏢 สาขา {br} : {monthly_branch[br]:,} รายการ\n"
+                        total += monthly_branch[br]
+                    msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                    msg += f"รวมทั้งเดือน: {total:,} รายการ"
+
+                reply_message(message_id, msg, token)
+                return
+
             # --- ฟีเจอร์ "สรุปยอด" (อ่านจาก Sheet โดยตรง กรองเฉพาะวันนี้) ---
             if "สรุปยอด" in text:
                 tz = timezone(timedelta(hours=7))
@@ -647,6 +870,13 @@ def process_event(data):
                     summary_text += f"รวมทั้งหมด: {total_count} รายการ"
 
                 reply_message(message_id, summary_text, token)
+
+                # บันทึก log รายวันลง Sheet สรุปยอดยิงส่ง (ถ้ามีข้อมูล)
+                if total_count > 0 and branch_summary and stoken:
+                    log_sid = get_summary_sheet_id(stoken, token)
+                    if log_sid:
+                        save_daily_log(today_str, branch_summary, stoken, log_sid, token)
+
                 return
 
             # ตรวจพบลูกน้ำ (,) ให้แจ้ง Error และหยุดการทำงานทันที
@@ -842,6 +1072,8 @@ def webhook():
 def health():
     return "JIRAYUTBOT is running! 🤖"
 
+
+start_midnight_scheduler()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
