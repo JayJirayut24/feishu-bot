@@ -1013,9 +1013,33 @@ def process_event(data):
                         msg = res.get("msg", "Unknown error")
                         results.append(f"❌ {sheet_name}: {msg}")
 
-        # === อัปเดตตัวนับรายวัน ===
+        # === อ่านยอดรวมวันนี้จาก Sheet โดยตรง (รองรับหลายคน/หลาย worker) ===
         total_awb = len(awb_list)
-        daily_total, today_date = add_to_daily_count(total_awb, branch_codes)
+        tz = timezone(timedelta(hours=7))
+        today_date = datetime.now(tz).strftime("%d/%m/%Y")
+
+        daily_total = total_awb  # fallback ถ้าอ่าน Sheet ไม่ได้
+        song_sheet_id = sheet_ids.get(BRANCH_CODE_SHEET)
+        if song_sheet_id:
+            try:
+                count_url = (
+                    f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+                    f"{spreadsheet_token}/values/{song_sheet_id}!A2:H5000"
+                )
+                count_raw = (
+                    requests.get(count_url, headers={"Authorization": f"Bearer {token}"})
+                    .json()
+                    .get("data", {}).get("valueRange", {}).get("values") or []
+                )
+                daily_total = sum(
+                    1 for row in count_raw
+                    if row and row[0]
+                    and str(row[0]).strip() not in ("", "None")
+                    and len(row) > 7 and row[7]
+                    and today_date in str(row[7])
+                )
+            except Exception:
+                pass
 
         # === สร้างข้อความสรุป ===
         summary = (
