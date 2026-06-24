@@ -705,7 +705,76 @@ def process_event(data):
                 return
 
         # ---------------------------------------------
-        # 2. กรณีเป็นข้อความปกติ (พิมพ์เข้ามาในแชท)
+        # 2. กรณีเป็นรูปภาพ — resize ให้พอดีแล้วตอบกลับ
+        # ---------------------------------------------
+        elif message_type == "image":
+            from PIL import Image as PILImage
+
+            content = json.loads(message.get("content", "{}"))
+            image_key = content.get("image_key")
+            if not image_key:
+                return
+
+            # ดาวน์โหลดภาพต้นฉบับ
+            img_url = (
+                f"https://open.feishu.cn/open-apis/im/v1/messages/"
+                f"{message_id}/resources/{image_key}?type=image"
+            )
+            img_res = requests.get(img_url, headers={"Authorization": f"Bearer {token}"})
+            if img_res.status_code != 200:
+                return
+
+            try:
+                img = PILImage.open(BytesIO(img_res.content))
+                w, h = img.size
+                MAX_DIM = 1000  # px — ถ้าด้านใดเกินนี้จะ resize
+
+                if max(w, h) <= MAX_DIM:
+                    return  # ภาพเล็กพอแล้ว ไม่ต้องทำอะไร
+
+                # คำนวณขนาดใหม่ คงสัดส่วนเดิม
+                scale = MAX_DIM / max(w, h)
+                new_size = (int(w * scale), int(h * scale))
+                img = img.resize(new_size, PILImage.LANCZOS)
+
+                # แปลงเป็น JPEG bytes
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                out_buf = BytesIO()
+                img.save(out_buf, format="JPEG", quality=88)
+                out_buf.seek(0)
+                resized_bytes = out_buf.getvalue()
+            except Exception:
+                return
+
+            # อัปโหลดภาพที่ resize แล้วขึ้น Feishu
+            upload_res = requests.post(
+                "https://open.feishu.cn/open-apis/im/v1/images",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"image_type": "message"},
+                files={"image": ("resized.jpg", resized_bytes, "image/jpeg")}
+            ).json()
+
+            new_image_key = upload_res.get("data", {}).get("image_key")
+            if not new_image_key:
+                return
+
+            # ตอบกลับด้วยภาพขนาดพอดี
+            requests.post(
+                f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8"
+                },
+                json={
+                    "msg_type": "image",
+                    "content": json.dumps({"image_key": new_image_key})
+                }
+            )
+            return
+
+        # ---------------------------------------------
+        # 3. กรณีเป็นข้อความปกติ (พิมพ์เข้ามาในแชท)
         # ---------------------------------------------
         elif message_type == "text":
             content = json.loads(message.get("content", "{}"))
