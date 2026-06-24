@@ -128,120 +128,125 @@ def extract_data_from_excel(file_bytes):
         awb_list = []
         branch_codes = []
 
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            all_rows = list(ws.iter_rows(values_only=True))
-            if not all_rows:
+        # ใช้เฉพาะ Sheet ที่ active ตอนที่ user save ไฟล์ (sheet หน้าล่าสุด)
+        ws = wb.active
+        if ws is None:
+            wb.close()
+            return [], []
+
+        all_rows = list(ws.iter_rows(values_only=True))
+        if not all_rows:
+            wb.close()
+            return [], []
+
+        # === ค้นหา header "สาขาที่ถูกต้อง" ใน 5 แถวแรก ===
+        TARGET = _normalize("สาขาที่ถูกต้อง")
+        correct_branch_col = None
+        awb_col = None
+        data_start_row = 0
+
+        for row_idx, row in enumerate(all_rows[:5]):
+            if not row:
                 continue
+            for i, cell in enumerate(row):
+                h = _normalize(_cell_to_str(cell))
+                if TARGET in h:
+                    correct_branch_col = i
+                if h.upper() == "AWB":
+                    awb_col = i
+            if correct_branch_col is not None:
+                data_start_row = row_idx + 1
+                break
 
-            # === ค้นหา header "สาขาที่ถูกต้อง" ใน 5 แถวแรก ===
-            TARGET = _normalize("สาขาที่ถูกต้อง")
-            correct_branch_col = None
-            awb_col = None
-            data_start_row = 0
-
-            for row_idx, row in enumerate(all_rows[:5]):
+        if correct_branch_col is not None:
+            for row in all_rows[data_start_row:]:
                 if not row:
                     continue
-                for i, cell in enumerate(row):
-                    h = _normalize(_cell_to_str(cell))
-                    if TARGET in h:
-                        correct_branch_col = i
-                    if h.upper() == "AWB":
-                        awb_col = i
-                if correct_branch_col is not None:
-                    data_start_row = row_idx + 1
-                    break
 
-            if correct_branch_col is not None:
-                for row in all_rows[data_start_row:]:
-                    if not row:
-                        continue
+                awb_str = ""
+                if awb_col is not None and awb_col < len(row):
+                    candidate = _cell_to_str(row[awb_col])
+                    if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
+                        awb_str = candidate
 
-                    awb_str = ""
-                    if awb_col is not None and awb_col < len(row):
-                        candidate = _cell_to_str(row[awb_col])
+                if not awb_str:
+                    for j, cell in enumerate(row):
+                        if j == correct_branch_col:
+                            continue
+                        candidate = _cell_to_str(cell)
                         if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
                             awb_str = candidate
+                            break
 
-                    if not awb_str:
-                        for j, cell in enumerate(row):
-                            if j == correct_branch_col:
-                                continue
-                            candidate = _cell_to_str(cell)
-                            if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
-                                awb_str = candidate
-                                break
+                if not awb_str:
+                    continue
 
-                    if not awb_str:
+                branch_str = ""
+                if correct_branch_col < len(row):
+                    candidate = _cell_to_str(row[correct_branch_col])
+                    if re.match(r'^\d{6}$', candidate):
+                        branch_str = candidate
+
+                awb_list.append(awb_str)
+                branch_codes.append(branch_str)
+
+            # ลบ AWB ซ้ำ (พร้อม branch ที่จับคู่)
+            seen = set()
+            deduped_awb, deduped_br = [], []
+            for awb, br in zip(awb_list, branch_codes):
+                if awb not in seen:
+                    seen.add(awb)
+                    deduped_awb.append(awb)
+                    deduped_br.append(br)
+            awb_list, branch_codes = deduped_awb, deduped_br
+
+        else:
+            start_idx = 0
+            if all_rows:
+                first_row_cells = [_cell_to_str(c) for c in (all_rows[0] or []) if c is not None]
+                has_data = any(
+                    re.match(r'^\d{12}$', v) or re.match(r'^B\d+$', v) or re.match(r'^\d{6}$', v)
+                    for v in first_row_cells
+                )
+                if not has_data:
+                    start_idx = 1
+
+            col_six = {}
+            for row in all_rows[start_idx:]:
+                if not row:
+                    continue
+                for j, cell in enumerate(row):
+                    v = _cell_to_str(cell)
+                    if v and re.match(r'^\d{6}$', v):
+                        col_six.setdefault(j, []).append(v)
+
+            # คอลัมน์ที่ทุกค่าเหมือนกัน (เช่น 812087 ทั้งหมด) = สาขาผิด → ข้าม
+            skip_cols = {j for j, vals in col_six.items()
+                         if len(vals) > 1 and len(set(vals)) == 1}
+
+            for row in all_rows[start_idx:]:
+                if not row:
+                    continue
+                for j, cell in enumerate(row):
+                    if j in skip_cols:
                         continue
-
-                    branch_str = ""
-                    if correct_branch_col < len(row):
-                        candidate = _cell_to_str(row[correct_branch_col])
-                        if re.match(r'^\d{6}$', candidate):
-                            branch_str = candidate
-
-                    awb_list.append(awb_str)
-                    branch_codes.append(branch_str)
-
-                # ลบ AWB ซ้ำ (พร้อม branch ที่จับคู่)
-                seen = set()
-                deduped_awb, deduped_br = [], []
-                for awb, br in zip(awb_list, branch_codes):
-                    if awb not in seen:
-                        seen.add(awb)
-                        deduped_awb.append(awb)
-                        deduped_br.append(br)
-                awb_list, branch_codes = deduped_awb, deduped_br
-
-            else:
-                start_idx = 0
-                if all_rows:
-                    first_row_cells = [_cell_to_str(c) for c in (all_rows[0] or []) if c is not None]
-                    has_data = any(
-                        re.match(r'^\d{12}$', v) or re.match(r'^B\d+$', v) or re.match(r'^\d{6}$', v)
-                        for v in first_row_cells
-                    )
-                    if not has_data:
-                        start_idx = 1
-
-                col_six = {}
-                for row in all_rows[start_idx:]:
-                    if not row:
+                    cell_str = _cell_to_str(cell)
+                    if not cell_str:
                         continue
-                    for j, cell in enumerate(row):
-                        v = _cell_to_str(cell)
-                        if v and re.match(r'^\d{6}$', v):
-                            col_six.setdefault(j, []).append(v)
+                    if re.match(r'^\d{12}$', cell_str):
+                        awb_list.append(cell_str)
+                    elif re.match(r'^B\d+$', cell_str):
+                        awb_list.append(cell_str)
+                    elif re.match(r'^\d{6}$', cell_str):
+                        branch_codes.append(cell_str)
 
-                # คอลัมน์ที่ทุกค่าเหมือนกัน (เช่น 812087 ทั้งหมด) = สาขาผิด → ข้าม
-                skip_cols = {j for j, vals in col_six.items()
-                             if len(vals) > 1 and len(set(vals)) == 1}
-
-                for row in all_rows[start_idx:]:
-                    if not row:
-                        continue
-                    for j, cell in enumerate(row):
-                        if j in skip_cols:
-                            continue
-                        cell_str = _cell_to_str(cell)
-                        if not cell_str:
-                            continue
-                        if re.match(r'^\d{12}$', cell_str):
-                            awb_list.append(cell_str)
-                        elif re.match(r'^B\d+$', cell_str):
-                            awb_list.append(cell_str)
-                        elif re.match(r'^\d{6}$', cell_str):
-                            branch_codes.append(cell_str)
-
-                seen = set()
-                unique_awb = []
-                for awb in awb_list:
-                    if awb not in seen:
-                        seen.add(awb)
-                        unique_awb.append(awb)
-                awb_list = unique_awb
+            seen = set()
+            unique_awb = []
+            for awb in awb_list:
+                if awb not in seen:
+                    seen.add(awb)
+                    unique_awb.append(awb)
+            awb_list = unique_awb
 
         wb.close()
         return awb_list, branch_codes
@@ -383,6 +388,81 @@ def save_daily_log(date_str, branch_summary, spreadsheet_token, summary_sheet_id
 
 
 # ---------------------------------------------------------
+# ลบแถวในชีตที่บันทึกมาจาก filename ที่ระบุ
+# ---------------------------------------------------------
+def delete_rows_by_filename(spreadsheet_token, sheet_id, filename_col_idx, filename, token):
+    """ลบแถวที่ column filename_col_idx ตรงกับ filename (case-insensitive)
+    คืนค่า (จำนวนที่ลบ, error_msg or None)
+    """
+    api_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    end_col_letter = chr(ord('A') + filename_col_idx)
+    read_url = (
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+        f"{spreadsheet_token}/values/{sheet_id}!A2:{end_col_letter}5000"
+    )
+    try:
+        raw = (
+            requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
+            .json()
+            .get("data", {}).get("valueRange", {}).get("values") or []
+        )
+    except Exception as e:
+        return 0, str(e)
+
+    fname_lower = filename.lower().strip()
+    match_rows = []
+    for i, row in enumerate(raw):
+        if not row or not row[0] or str(row[0]).strip() in ("", "None"):
+            continue
+        cell_val = (
+            str(row[filename_col_idx]).strip().lower()
+            if len(row) > filename_col_idx and row[filename_col_idx]
+            else ""
+        )
+        if cell_val and (fname_lower in cell_val or cell_val in fname_lower):
+            match_rows.append(i + 2)  # 1-based sheet row
+
+    if not match_rows:
+        return 0, None
+
+    count = len(match_rows)
+
+    # จัดกลุ่ม contiguous ranges แล้วลบจากล่างขึ้นบน (ไม่ให้ index เลื่อน)
+    sorted_desc = sorted(match_rows, reverse=True)
+    ranges = []
+    g_end = sorted_desc[0]
+    g_start = sorted_desc[0]
+    for r in sorted_desc[1:]:
+        if r == g_start - 1:
+            g_start = r
+        else:
+            ranges.append((g_start, g_end))
+            g_end = r
+            g_start = r
+    ranges.append((g_start, g_end))
+
+    delete_url = (
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+        f"{spreadsheet_token}/dimension_range"
+    )
+    for (s, e) in ranges:
+        try:
+            requests.delete(delete_url, headers=api_headers, json={
+                "dimension": {
+                    "sheetId": sheet_id,
+                    "majorDimension": "ROWS",
+                    "startIndex": s,
+                    "endIndex": e + 1
+                }
+            })
+        except Exception:
+            pass
+
+    return count, None
+
+
+# ---------------------------------------------------------
 # ตัดยอดอัตโนมัติเวลา 00:00 น.
 # ---------------------------------------------------------
 def midnight_daily_cutoff():
@@ -484,7 +564,7 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
 # เขียนข้อมูลลง ยิงส่ง - ITCBI โดยไม่แตะคอลัมน์ G เลย
 # (ค้นหาแถวว่าง → PUT เฉพาะ A, F, H)
 # ---------------------------------------------------------
-def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timestamp, token):
+def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timestamp, token, filename=""):
     api_headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -565,6 +645,20 @@ def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timest
             errors.append(f"H: {d.get('msg')}")
     except Exception:
         pass
+
+    if filename:
+        res_i = requests.put(put_url, headers=api_headers, json={
+            "valueRange": {
+                "range": f"{sheet_id}!I{next_row}:I{end_row}",
+                "values": [[filename]] * n
+            }
+        })
+        try:
+            d = res_i.json()
+            if d.get("code", -1) != 0:
+                errors.append(f"I: {d.get('msg')}")
+        except Exception:
+            pass
 
     if errors:
         return {"code": -1, "msg": " | ".join(errors)}
@@ -671,6 +765,7 @@ def process_event(data):
         awb_list = []
         branch_codes = []
         is_valid_input = False
+        file_name = ""
 
         # ---------------------------------------------
         # 1. กรณีเป็นไฟล์
@@ -780,8 +875,45 @@ def process_event(data):
             content = json.loads(message.get("content", "{}"))
             text = content.get("text", "")
 
-            # --- ฟีเจอร์ "ลบข้อมูล" (Clear/Reset) ---
+            # --- ฟีเจอร์ "clear <filename>" (ลบเฉพาะไฟล์ที่ระบุ) ---
             clean_text = text.lower()
+            clear_file_match = re.match(r'^clear\s+(\S+)', clean_text.strip())
+            if clear_file_match:
+                target_filename = clear_file_match.group(1).strip()
+                try:
+                    _spreadsheet_token, _error = get_spreadsheet_token(token)
+                    if not _spreadsheet_token:
+                        reply_message(message_id, f"❌ ไม่สามารถเข้าถึง Spreadsheet ได้: {_error}", token)
+                        return
+
+                    _sheet_ids = get_sheet_ids(_spreadsheet_token, token)
+                    total_deleted = 0
+
+                    for sname, sid in _sheet_ids.items():
+                        # ยิงส่ง = column I (idx 8), ยิงถึง = column G (idx 6)
+                        col_idx = 8 if sname == BRANCH_CODE_SHEET else 6
+                        deleted, _ = delete_rows_by_filename(_spreadsheet_token, sid, col_idx, target_filename, token)
+                        total_deleted += deleted
+
+                    if total_deleted > 0:
+                        reply_message(
+                            message_id,
+                            f"🗑️ ลบข้อมูลจากไฟล์ '{target_filename}' เสร็จสิ้น\n"
+                            f"ลบทั้งหมด {total_deleted:,} รายการ",
+                            token
+                        )
+                    else:
+                        reply_message(
+                            message_id,
+                            f"⚠️ ไม่พบข้อมูลจากไฟล์ '{target_filename}' ในระบบครับ\n"
+                            "(ฟีเจอร์นี้รองรับเฉพาะไฟล์ที่อัปโหลดหลังจากอัปเดตนี้)",
+                            token
+                        )
+                except Exception as e:
+                    reply_message(message_id, f"❌ เกิดข้อผิดพลาด: {str(e)}", token)
+                return
+
+            # --- ฟีเจอร์ "ลบข้อมูล" (Clear/Reset) ---
             if any(cmd in clean_text for cmd in ["clear", "ลบข้อมูล", "reset"]):
                 try:
                     _spreadsheet_token, _error = get_spreadsheet_token(token)
@@ -1061,7 +1193,7 @@ def process_event(data):
                 # "ยิงส่ง - ITCBI": PUT เฉพาะ A, F, H — ไม่แตะ G เลย
                 res = write_song_sheet(
                     spreadsheet_token, sheet_id,
-                    awb_list, branch_codes, today_time_str, token
+                    awb_list, branch_codes, today_time_str, token, file_name
                 )
                 if res.get("code", -1) == 0:
                     results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
@@ -1072,8 +1204,8 @@ def process_event(data):
                 if awb_list:
                     rows = []
                     for awb in awb_list:
-                        # [Col A,  B,    C,    D,    E,    F            ]
-                        rows.append([awb, None, None, None, None, today_time_str])
+                        # [Col A,  B,    C,    D,    E,    F,              G        ]
+                        rows.append([awb, None, None, None, None, today_time_str, file_name])
                     res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
                     code = res.get("code", -1)
                     if code == 0:
