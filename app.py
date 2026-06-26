@@ -1008,6 +1008,7 @@ def process_event(data):
                         msg = f"❌ ล้างข้อมูลไม่สำเร็จ: {err}\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
 
                     reply_message(message_id, msg, token)
+                    send_menu_card(message_id, token)
 
                 except Exception as e:
                     reply_message(message_id, f"❌ เกิดข้อผิดพลาดในระบบลบข้อมูล: {str(e)}", token)
@@ -1080,6 +1081,7 @@ def process_event(data):
                     msg += f"รวมทั้งเดือน: {total:,} รายการ"
 
                 reply_message(message_id, msg, token)
+                send_menu_card(message_id, token)
                 return
 
             # --- ฟีเจอร์ "สรุปยอด" (อ่านจาก Sheet โดยตรง กรองเฉพาะวันนี้) ---
@@ -1146,6 +1148,7 @@ def process_event(data):
                     if log_sid:
                         save_daily_log(today_str, branch_summary, stoken, log_sid, token)
 
+                send_menu_card(message_id, token)
                 return
 
             # ตรวจพบลูกน้ำ (,) ให้แจ้ง Error และหยุดการทำงานทันที
