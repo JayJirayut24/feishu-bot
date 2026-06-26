@@ -743,6 +743,49 @@ def reply_message(message_id, text, token):
 
 
 # ---------------------------------------------------------
+# ส่ง Interactive Card พร้อมปุ่มเมนู
+# ---------------------------------------------------------
+def send_menu_card(message_id, token):
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "🤖 JIRAYUTBOT เมนูหลัก"},
+            "template": "blue"
+        },
+        "elements": [
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "📊 สรุปยอดวันนี้"},
+                        "type": "primary",
+                        "value": {"command": "สรุปยอด"}
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "📅 สรุปยอดเดือนนี้"},
+                        "type": "default",
+                        "value": {"command": "สรุปเดือน"}
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "🗑️ ลบข้อมูลทั้งหมด"},
+                        "type": "danger",
+                        "value": {"command": "ลบข้อมูล"}
+                    }
+                ]
+            }
+        ]
+    }
+    requests.post(
+        f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+        json={"msg_type": "interactive", "content": json.dumps(card)}
+    )
+
+
+# ---------------------------------------------------------
 # ฟังก์ชันจัดการ Event แบบ Asynchronous
 # ---------------------------------------------------------
 def process_event(data):
@@ -870,6 +913,14 @@ def process_event(data):
         elif message_type == "text":
             content = json.loads(message.get("content", "{}"))
             text = content.get("text", "")
+
+            # ลบ @mention ออก (กรณีใช้ในกลุ่ม เช่น "@JIRAYUTBOT สรุปยอด" → "สรุปยอด")
+            text = re.sub(r'@\S+', '', text).strip()
+
+            # ถ้าข้อความว่าง (แค่ @mention) หรือพิมพ์ "เมนู" → แสดงการ์ดปุ่ม
+            if not text or text.strip() == "เมนู":
+                send_menu_card(message_id, token)
+                return
 
             # --- ฟีเจอร์ "clear <filename>" (ลบเฉพาะไฟล์ที่ระบุ) ---
             clean_text = text.lower()
@@ -1299,6 +1350,35 @@ def webhook():
 
     # ตอบกลับ Feishu ทันทีว่า "รับทราบแล้ว" เพื่อไม่ให้ Feishu ส่งซ้ำ
     return jsonify({"status": "ok"})
+
+
+# ---------------------------------------------------------
+# Card Callback Endpoint (รับ Event เมื่อกดปุ่มในการ์ด)
+# ---------------------------------------------------------
+@app.route("/card_callback", methods=["POST"])
+def card_callback():
+    data = request.json or {}
+
+    if "challenge" in data:
+        return jsonify({"challenge": data["challenge"]})
+
+    command = data.get("action", {}).get("value", {}).get("command", "")
+    open_message_id = data.get("open_message_id", "")
+
+    if command and open_message_id:
+        fake_event = {
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "message": {
+                    "message_type": "text",
+                    "message_id": open_message_id,
+                    "content": json.dumps({"text": command})
+                }
+            }
+        }
+        threading.Thread(target=process_event, args=(fake_event,)).start()
+
+    return jsonify({})
 
 
 # ---------------------------------------------------------
