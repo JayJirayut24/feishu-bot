@@ -38,6 +38,18 @@ SUMMARY_LOG_SHEET = "สรุปยอดยิงส่ง"
 BKK_TZ = timezone(timedelta(hours=7))
 
 # ---------------------------------------------------------
+# Cache สำหรับ API token และ Sheet IDs (ลด API call ซ้ำ)
+# ---------------------------------------------------------
+_api_cache = {
+    "token": None,
+    "token_expires": 0.0,
+    "stoken": None,
+    "sheet_ids": None,
+    "summary_sheet_id": None,
+}
+_api_cache_lock = threading.Lock()
+
+# ---------------------------------------------------------
 # ระบบเก็บ State จำนวน AWB แบบรายวัน และ รหัสสาขา
 # ---------------------------------------------------------
 STATE_FILE = "state.json"
@@ -88,11 +100,18 @@ def add_to_daily_count(new_count, branch_list):
 # ฟังก์ชันขอ Token จาก Feishu
 # ---------------------------------------------------------
 def get_tenant_access_token():
-    """ขอ Tenant Access Token จาก Feishu Open API"""
+    """ขอ Tenant Access Token จาก Feishu (cache ไว้ตลอด expire)"""
+    with _api_cache_lock:
+        if _api_cache["token"] and time.time() < _api_cache["token_expires"]:
+            return _api_cache["token"]
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    payload = {"app_id": APP_ID, "app_secret": APP_SECRET}
-    res = requests.post(url, json=payload).json()
-    return res.get("tenant_access_token")
+    res = requests.post(url, json={"app_id": APP_ID, "app_secret": APP_SECRET}).json()
+    token = res.get("tenant_access_token")
+    expire = int(res.get("expire", 7200))
+    with _api_cache_lock:
+        _api_cache["token"] = token
+        _api_cache["token_expires"] = time.time() + expire - 120
+    return token
 
 
 # ---------------------------------------------------------
@@ -259,7 +278,10 @@ def extract_data_from_excel(file_bytes):
 # ฟังก์ชันดึง Spreadsheet Token จาก Wiki Token
 # ---------------------------------------------------------
 def get_spreadsheet_token(token):
-    """ดึง obj_token (Spreadsheet Token จริง) จาก Wiki Node"""
+    """ดึง obj_token (Spreadsheet Token จริง) จาก Wiki Node (cached)"""
+    with _api_cache_lock:
+        if _api_cache["stoken"]:
+            return _api_cache["stoken"], None
     url = f"https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token={WIKI_TOKEN}"
     headers = {"Authorization": f"Bearer {token}"}
     try:
@@ -267,7 +289,11 @@ def get_spreadsheet_token(token):
         if res.get("code") != 0:
             return None, f"API Error: {res.get('msg')} (Code: {res.get('code')})"
         node = res.get("data", {}).get("node", {})
-        return node.get("obj_token"), None
+        stoken = node.get("obj_token")
+        if stoken:
+            with _api_cache_lock:
+                _api_cache["stoken"] = stoken
+        return stoken, None
     except Exception as e:
         return None, f"Request Error: {str(e)}"
 
@@ -276,7 +302,10 @@ def get_spreadsheet_token(token):
 # ฟังก์ชันดึง Sheet ID ของ Sheet ที่ต้องการ
 # ---------------------------------------------------------
 def get_sheet_ids(spreadsheet_token, token):
-    """ค้นหา Sheet ID ของ Sheet ชื่อ 'ยิงส่ง - ITCBI' และ 'ยิงถึง - ITCBI'"""
+    """ค้นหา Sheet ID ของ Sheet ชื่อ 'ยิงส่ง - ITCBI' และ 'ยิงถึง - ITCBI' (cached)"""
+    with _api_cache_lock:
+        if _api_cache["sheet_ids"]:
+            return _api_cache["sheet_ids"]
     url = f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/query"
     headers = {"Authorization": f"Bearer {token}"}
     try:
@@ -290,6 +319,9 @@ def get_sheet_ids(spreadsheet_token, token):
             if title in TARGET_SHEET_NAMES:
                 sheet_ids[title] = sheet_id
 
+        if sheet_ids:
+            with _api_cache_lock:
+                _api_cache["sheet_ids"] = sheet_ids
         return sheet_ids
     except Exception:
         return {}
@@ -569,17 +601,16 @@ def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timest
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
-    put_url = (
-        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-        f"{spreadsheet_token}/values"
-    )
 
-    # 1. หาแถวถัดไปที่ว่าง (อ่าน A2:A5000)
+    # อ่านครั้งเดียว A2:H5000 — ใช้หา next_row และนับยอดวันนี้พร้อมกัน
     read_url = (
         f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-        f"{spreadsheet_token}/values/{sheet_id}!A2:A5000"
+        f"{spreadsheet_token}/values/{sheet_id}!A2:H5000"
     )
+    tz = timezone(timedelta(hours=7))
+    today_date = datetime.now(tz).strftime("%d/%m/%Y")
     next_row = 2
+    today_count_before = 0
     try:
         raw = (
             requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
@@ -590,79 +621,44 @@ def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timest
         for i, row in enumerate(raw):
             if row and row[0] not in (None, "", "None"):
                 last_idx = i
+                time_val = str(row[7]).strip() if len(row) > 7 and row[7] else ""
+                if today_date in time_val:
+                    today_count_before += 1
         if last_idx >= 0:
-            next_row = last_idx + 3  # raw[i]=A(i+2), แถวถัดไป = A(i+3)
+            next_row = last_idx + 3
     except Exception:
         pass
 
     n = len(awb_list)
     if n == 0:
-        return {"code": 0}
+        return {"code": 0}, today_count_before
     end_row = next_row + n - 1
 
-    # 2. PUT เฉพาะ A (AWB), F (สาขา), H (เวลา) — ไม่แตะ B C D E G
-    errors = []
-
-    res_a = requests.put(put_url, headers=api_headers, json={
-        "valueRange": {
-            "range": f"{sheet_id}!A{next_row}:A{end_row}",
-            "values": [[awb] for awb in awb_list]
-        }
-    })
-    try:
-        d = res_a.json()
-        if d.get("code", -1) != 0:
-            errors.append(f"A: {d.get('msg')}")
-    except Exception:
-        pass
-
-    f_values = []
-    for i in range(n):
-        br = branch_codes[i] if branch_codes and i < len(branch_codes) else ""
-        f_values.append([br])
-    res_f = requests.put(put_url, headers=api_headers, json={
-        "valueRange": {
-            "range": f"{sheet_id}!F{next_row}:F{end_row}",
-            "values": f_values
-        }
-    })
-    try:
-        d = res_f.json()
-        if d.get("code", -1) != 0:
-            errors.append(f"F: {d.get('msg')}")
-    except Exception:
-        pass
-
-    res_h = requests.put(put_url, headers=api_headers, json={
-        "valueRange": {
-            "range": f"{sheet_id}!H{next_row}:H{end_row}",
-            "values": [[timestamp]] * n
-        }
-    })
-    try:
-        d = res_h.json()
-        if d.get("code", -1) != 0:
-            errors.append(f"H: {d.get('msg')}")
-    except Exception:
-        pass
-
+    # Batch PUT: รวม A, F, H, I เป็น 1 API call เดียว
+    f_values = [
+        [branch_codes[i] if branch_codes and i < len(branch_codes) else ""]
+        for i in range(n)
+    ]
+    value_ranges = [
+        {"range": f"{sheet_id}!A{next_row}:A{end_row}", "values": [[awb] for awb in awb_list]},
+        {"range": f"{sheet_id}!F{next_row}:F{end_row}", "values": f_values},
+        {"range": f"{sheet_id}!H{next_row}:H{end_row}", "values": [[timestamp]] * n},
+    ]
     if filename:
-        res_i = requests.put(put_url, headers=api_headers, json={
-            "valueRange": {
-                "range": f"{sheet_id}!I{next_row}:I{end_row}",
-                "values": [[filename]] * n
-            }
-        })
-        try:
-            d = res_i.json()
-            if d.get("code", -1) != 0:
-                errors.append(f"I: {d.get('msg')}")
-        except Exception:
-            pass
+        value_ranges.append({"range": f"{sheet_id}!I{next_row}:I{end_row}", "values": [[filename]] * n})
 
-    if errors:
-        return {"code": -1, "msg": " | ".join(errors)}
-    return {"code": 0}
+    batch_url = (
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+        f"{spreadsheet_token}/values_batch_update"
+    )
+    try:
+        res = requests.put(batch_url, headers=api_headers, json={"valueRanges": value_ranges}).json()
+        if res.get("code") == 0:
+            return {"code": 0}, today_count_before + n
+        else:
+            return {"code": -1, "msg": res.get("msg", "batch update failed")}, today_count_before
+    except Exception as e:
+        return {"code": -1, "msg": str(e)}, today_count_before
 
 
 # ---------------------------------------------------------
@@ -822,7 +818,7 @@ def process_event(data):
             try:
                 img = PILImage.open(BytesIO(img_res.content))
                 w, h = img.size
-                MAX_DIM = 1000  # px — ถ้าด้านใดเกินนี้จะ resize
+                MAX_DIM = 500  # px — resize ทุกรูปที่ใหญ่กว่านี้
 
                 if max(w, h) <= MAX_DIM:
                     return  # ภาพเล็กพอแล้ว ไม่ต้องทำอะไร
@@ -935,7 +931,28 @@ def process_event(data):
                     save_state()
 
                     if ok:
-                        msg = "🗑️ ล้างข้อมูลทุกคอลัมน์เรียบร้อยแล้วครับ\n✅ ยิงส่ง - ITCBI, ยิงถึง - ITCBI\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
+                        # เขียนสูตร XLOOKUP กลับที่ G2 ของ ยิงส่ง - ITCBI
+                        song_id = _sheet_ids.get(BRANCH_CODE_SHEET)
+                        if song_id:
+                            try:
+                                xlookup = (
+                                    "=XLOOKUP(\"*\"&VALUE(F2)&\"*\","
+                                    "'รอบรถ'!$D$2:$D$300,"
+                                    "'รอบรถ'!$C$2:$C$300,"
+                                    "\"ไม่พบรอบรถ\",2,1)"
+                                )
+                                requests.put(
+                                    f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+                                    f"{_spreadsheet_token}/values",
+                                    headers={
+                                        "Authorization": f"Bearer {token}",
+                                        "Content-Type": "application/json"
+                                    },
+                                    json={"valueRange": {"range": f"{song_id}!G2", "values": [[xlookup]]}}
+                                )
+                            except Exception:
+                                pass
+                        msg = "🗑️ ล้างข้อมูลทุกคอลัมน์เรียบร้อยแล้วครับ\n✅ ยิงส่ง - ITCBI, ยิงถึง - ITCBI\n📝 เขียนสูตร XLOOKUP กลับที่ G2 แล้ว"
                     else:
                         msg = f"❌ ล้างข้อมูลไม่สำเร็จ: {err}\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
 
@@ -1186,61 +1203,56 @@ def process_event(data):
             return
 
         results = []
-        today_time_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M:%S")
-
-        for sheet_name, sheet_id in sheet_ids.items():
-            if sheet_name == BRANCH_CODE_SHEET:
-                # "ยิงส่ง - ITCBI": PUT เฉพาะ A, F, H — ไม่แตะ G เลย
-                res = write_song_sheet(
-                    spreadsheet_token, sheet_id,
-                    awb_list, branch_codes, today_time_str, token, file_name
-                )
-                if res.get("code", -1) == 0:
-                    results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
-                else:
-                    results.append(f"❌ {sheet_name}: {res.get('msg', 'Unknown error')}")
-            else:
-                # "ยิงถึง - ITCBI": มีแค่ AWB และวันที่
-                if awb_list:
-                    rows = []
-                    for awb in awb_list:
-                        # [Col A,  B,    C,    D,    E,    F,              G        ]
-                        rows.append([awb, None, None, None, None, today_time_str, file_name])
-                    res = append_to_feishu_sheet(spreadsheet_token, sheet_id, rows, "A", token)
-                    code = res.get("code", -1)
-                    if code == 0:
-                        results.append(f"✅ {sheet_name}: บันทึกข้อมูลสำเร็จ")
-                    else:
-                        msg = res.get("msg", "Unknown error")
-                        results.append(f"❌ {sheet_name}: {msg}")
-
-        # === อ่านยอดรวมวันนี้จาก Sheet โดยตรง (รองรับหลายคน/หลาย worker) ===
         total_awb = len(awb_list)
         tz = timezone(timedelta(hours=7))
         today_date = datetime.now(tz).strftime("%d/%m/%Y")
+        today_time_str = datetime.now(tz).strftime("%d/%m/%Y %H:%M:%S")
+        daily_total = total_awb  # fallback
 
-        daily_total = total_awb  # fallback ถ้าอ่าน Sheet ไม่ได้
-        song_sheet_id = sheet_ids.get(BRANCH_CODE_SHEET)
-        if song_sheet_id:
-            try:
-                count_url = (
-                    f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-                    f"{spreadsheet_token}/values/{song_sheet_id}!A2:H5000"
+        # เขียนทั้งสอง sheet พร้อมกัน (parallel)
+        song_out = [{"code": 0}, total_awb]
+        tung_out = [{"code": 0}]
+
+        def _write_song():
+            sid = sheet_ids.get(BRANCH_CODE_SHEET)
+            if sid:
+                res, dtotal = write_song_sheet(
+                    spreadsheet_token, sid, awb_list, branch_codes, today_time_str, token, file_name
                 )
-                count_raw = (
-                    requests.get(count_url, headers={"Authorization": f"Bearer {token}"})
-                    .json()
-                    .get("data", {}).get("valueRange", {}).get("values") or []
-                )
-                daily_total = sum(
-                    1 for row in count_raw
-                    if row and row[0]
-                    and str(row[0]).strip() not in ("", "None")
-                    and len(row) > 7 and row[7]
-                    and today_date in str(row[7])
-                )
-            except Exception:
-                pass
+                song_out[0] = res
+                song_out[1] = dtotal
+
+        def _write_tung():
+            for sname, sid in sheet_ids.items():
+                if sname != BRANCH_CODE_SHEET and awb_list:
+                    rows = [
+                        [awb, None, None, None, None, today_time_str, file_name]
+                        for awb in awb_list
+                    ]
+                    tung_out[0] = append_to_feishu_sheet(spreadsheet_token, sid, rows, "A", token)
+
+        t_song = threading.Thread(target=_write_song)
+        t_tung = threading.Thread(target=_write_tung)
+        t_song.start()
+        t_tung.start()
+        t_song.join()
+        t_tung.join()
+
+        daily_total = song_out[1]
+
+        song_sid = sheet_ids.get(BRANCH_CODE_SHEET)
+        if song_sid:
+            if song_out[0].get("code", -1) == 0:
+                results.append(f"✅ {BRANCH_CODE_SHEET}: บันทึกข้อมูลสำเร็จ")
+            else:
+                results.append(f"❌ {BRANCH_CODE_SHEET}: {song_out[0].get('msg', 'Unknown error')}")
+
+        for sname in sheet_ids:
+            if sname != BRANCH_CODE_SHEET:
+                if tung_out[0].get("code", -1) == 0:
+                    results.append(f"✅ {sname}: บันทึกข้อมูลสำเร็จ")
+                else:
+                    results.append(f"❌ {sname}: {tung_out[0].get('msg', 'Unknown error')}")
 
         # === สร้างข้อความสรุป ===
         summary = (
@@ -1250,7 +1262,6 @@ def process_event(data):
             f"━━━━━━━━━━━━━━━━━━━━\n"
         )
 
-        # ถ้ามีข้อผิดพลาด ให้แสดงด้วย
         errors = [msg for msg in results if "❌" in msg]
         if errors:
             summary += "\n".join(errors) + "\n━━━━━━━━━━━━━━━━━━━━\n"
