@@ -651,14 +651,19 @@ def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timest
         f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
         f"{spreadsheet_token}/values_batch_update"
     )
-    try:
-        res = requests.put(batch_url, headers=api_headers, json={"valueRanges": value_ranges}).json()
-        if res.get("code") == 0:
-            return {"code": 0}, today_count_before + n
-        else:
-            return {"code": -1, "msg": res.get("msg", "batch update failed")}, today_count_before
-    except Exception as e:
-        return {"code": -1, "msg": str(e)}, today_count_before
+    last_err = ""
+    for attempt in range(3):
+        try:
+            resp = requests.put(batch_url, headers=api_headers, json={"valueRanges": value_ranges})
+            res = resp.json()
+            if res.get("code") == 0:
+                return {"code": 0}, today_count_before + n
+            last_err = res.get("msg", "batch update failed")
+        except Exception as e:
+            raw = resp.text[:200] if 'resp' in dir() else "no response"
+            last_err = f"{str(e)} | raw={raw}"
+        time.sleep(1)
+    return {"code": -1, "msg": last_err}, today_count_before
 
 
 # ---------------------------------------------------------
@@ -1323,6 +1328,7 @@ def process_event(data):
         summary += "✅ ประมวลผลเสร็จสิ้น!"
 
         reply_message(message_id, summary, token)
+        send_menu_card(message_id, token)
 
 # ---------------------------------------------------------
 # Webhook Endpoint (รับ Event จาก Feishu)
