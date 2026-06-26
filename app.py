@@ -818,7 +818,7 @@ def process_event(data):
             try:
                 img = PILImage.open(BytesIO(img_res.content))
                 w, h = img.size
-                MAX_DIM = 500  # px — resize ทุกรูปที่ใหญ่กว่านี้
+                MAX_DIM = 500
 
                 if max(w, h) <= MAX_DIM:
                     return  # ภาพเล็กพอแล้ว ไม่ต้องทำอะไร
@@ -952,7 +952,7 @@ def process_event(data):
                                 )
                             except Exception:
                                 pass
-                        msg = "🗑️ ล้างข้อมูลทุกคอลัมน์เรียบร้อยแล้วครับ\n✅ ยิงส่ง - ITCBI, ยิงถึง - ITCBI\n📝 เขียนสูตร XLOOKUP กลับที่ G2 แล้ว"
+                        msg = "🗑️ เครียข้อมูล ยิงถึง-ยิงส่ง เรียบร้อยแล้ว\n📝 เขียนสูตร XLOOKUP กลับเรียบร้อยแล้ว"
                     else:
                         msg = f"❌ ล้างข้อมูลไม่สำเร็จ: {err}\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
 
