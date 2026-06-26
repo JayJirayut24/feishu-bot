@@ -611,7 +611,7 @@ def append_to_feishu_sheet(spreadsheet_token, sheet_id, values, start_col, token
 # เขียนข้อมูลลง ยิงส่ง - ITCBI โดยไม่แตะคอลัมน์ G เลย
 # (ค้นหาแถวว่าง → PUT เฉพาะ A, F, H)
 # ---------------------------------------------------------
-def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timestamp, token, filename=""):
+def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timestamp, token, filename="", sender_name=""):
     api_headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -659,8 +659,9 @@ def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timest
         {"range": f"{sheet_id}!F{next_row}:F{end_row}", "values": f_values},
         {"range": f"{sheet_id}!H{next_row}:H{end_row}", "values": [[timestamp]] * n},
     ]
-    if filename:
-        value_ranges.append({"range": f"{sheet_id}!I{next_row}:I{end_row}", "values": [[filename]] * n})
+    col_i_val = filename if filename else sender_name
+    if col_i_val:
+        value_ranges.append({"range": f"{sheet_id}!I{next_row}:I{end_row}", "values": [[col_i_val]] * n})
 
     values_url = (
         f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
@@ -823,12 +824,18 @@ def process_event(data):
         message_type = message.get("message_type")
         message_id = message.get("message_id")
         pressed_by = data["event"].get("_pressed_by", "")
+        sender_open_id = (
+            data["event"].get("sender", {}).get("sender_id", {}).get("open_id", "")
+        )
 
         token = get_tenant_access_token()
         awb_list = []
         branch_codes = []
         is_valid_input = False
         file_name = ""
+        sender_name = ""
+        if sender_open_id:
+            sender_name = get_user_display_name(sender_open_id, token)
 
         # ---------------------------------------------
         # 1. กรณีเป็นไฟล์
@@ -1301,7 +1308,7 @@ def process_event(data):
             sid = sheet_ids.get(BRANCH_CODE_SHEET)
             if sid:
                 res, dtotal = write_song_sheet(
-                    spreadsheet_token, sid, awb_list, branch_codes, today_time_str, token, file_name
+                    spreadsheet_token, sid, awb_list, branch_codes, today_time_str, token, file_name, sender_name
                 )
                 song_out[0] = res
                 song_out[1] = dtotal
