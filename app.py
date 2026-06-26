@@ -114,6 +114,21 @@ def get_tenant_access_token():
     return token
 
 
+def get_user_display_name(open_id, token):
+    """ดึงชื่อผู้ใช้จาก open_id"""
+    try:
+        res = requests.get(
+            f"https://open.feishu.cn/open-apis/contact/v3/users/{open_id}",
+            params={"user_id_type": "open_id"},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        ).json()
+        name = res.get("data", {}).get("user", {}).get("name", "")
+        return name if name else open_id[-8:]
+    except Exception:
+        return open_id[-8:]
+
+
 # ---------------------------------------------------------
 # ฟังก์ชันดาวน์โหลดไฟล์จากแชท Feishu
 # ---------------------------------------------------------
@@ -755,7 +770,7 @@ def reply_message(message_id, text, token):
 # ---------------------------------------------------------
 def send_menu_card(message_id, token):
     card = {
-        "config": {"wide_screen_mode": True},
+        "config": {"wide_screen_mode": False},
         "header": {
             "title": {"tag": "plain_text", "content": "🤖 JIRAYUTBOT เมนูหลัก"},
             "template": "blue"
@@ -807,6 +822,7 @@ def process_event(data):
         message = data["event"].get("message", {})
         message_type = message.get("message_type")
         message_id = message.get("message_id")
+        pressed_by = data["event"].get("_pressed_by", "")
 
         token = get_tenant_access_token()
         awb_list = []
@@ -1015,6 +1031,8 @@ def process_event(data):
                     else:
                         msg = f"❌ ล้างข้อมูลไม่สำเร็จ: {err}\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
 
+                    if pressed_by:
+                        msg += f"\n👤 : {pressed_by}"
                     reply_message(message_id, msg, token)
                     send_menu_card(message_id, token)
 
@@ -1088,6 +1106,8 @@ def process_event(data):
                     msg += "━━━━━━━━━━━━━━━━━━━━\n"
                     msg += f"รวมทั้งเดือน: {total:,} รายการ"
 
+                if pressed_by:
+                    msg += f"\n👤 กดโดย: {pressed_by}"
                 reply_message(message_id, msg, token)
                 send_menu_card(message_id, token)
                 return
@@ -1148,6 +1168,8 @@ def process_event(data):
                     summary_text += "━━━━━━━━━━━━━━━━━━━━\n"
                     summary_text += f"รวมทั้งหมด: {total_count} รายการ"
 
+                if pressed_by:
+                    summary_text += f"\n👤 กดโดย: {pressed_by}"
                 reply_message(message_id, summary_text, token)
 
                 # บันทึก log รายวันลง Sheet สรุปยอดยิงส่ง (ถ้ามีข้อมูล)
@@ -1380,9 +1402,11 @@ def card_callback():
     context = event.get("context", {})
     command = action.get("value", {}).get("command", "")
     open_message_id = context.get("open_message_id", "")
-    print(f"[CARD_CALLBACK] command={command!r} message_id={open_message_id!r}", flush=True)
+    open_id = event.get("operator", {}).get("open_id", "")
 
     if command and open_message_id:
+        cb_token = get_tenant_access_token()
+        pressed_by = get_user_display_name(open_id, cb_token) if open_id else ""
         fake_event = {
             "header": {"event_type": "im.message.receive_v1"},
             "event": {
@@ -1390,7 +1414,8 @@ def card_callback():
                     "message_type": "text",
                     "message_id": open_message_id,
                     "content": json.dumps({"text": command})
-                }
+                },
+                "_pressed_by": pressed_by
             }
         }
         threading.Thread(target=process_event, args=(fake_event,)).start()
