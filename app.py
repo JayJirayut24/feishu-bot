@@ -653,15 +653,29 @@ def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timest
     )
     last_err = ""
     for attempt in range(3):
+        resp = None
         try:
             resp = requests.put(batch_url, headers=api_headers, json={"valueRanges": value_ranges})
+            raw_text = resp.text.strip()
+            # ถ้า response ไม่ใช่ JSON (เช่น "404 page not found") → ล้าง stoken cache แล้ว retry
+            if not raw_text.startswith('{'):
+                with _api_cache_lock:
+                    _api_cache["stoken"] = None
+                new_stoken, _ = get_spreadsheet_token(token)
+                if new_stoken:
+                    batch_url = (
+                        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+                        f"{new_stoken}/values_batch_update"
+                    )
+                last_err = f"non-JSON response: {raw_text[:80]}"
+                time.sleep(1)
+                continue
             res = resp.json()
             if res.get("code") == 0:
                 return {"code": 0}, today_count_before + n
             last_err = res.get("msg", "batch update failed")
         except Exception as e:
-            raw = resp.text[:200] if 'resp' in dir() else "no response"
-            last_err = f"{str(e)} | raw={raw}"
+            last_err = f"{str(e)} | raw={resp.text[:100] if resp is not None else 'no response'}"
         time.sleep(1)
     return {"code": -1, "msg": last_err}, today_count_before
 
