@@ -1011,7 +1011,7 @@ def process_event(data):
                                 )
                             except Exception:
                                 pass
-                        msg = "🗑️ เครียข้อมูล ยิงถึง-ยิงส่ง เรียบร้อยแล้ว\n📝 เขียนสูตร XLOOKUP กลับเรียบร้อยแล้ว"
+                        msg = "🗑️ เครียข้อมูล ยิงถึง-ยิงส่ง เรียบร้อยแล้ว\n📝 เขียนสูตร XLOOKUP กับเรียบร้อยแล้ว"
                     else:
                         msg = f"❌ ล้างข้อมูลไม่สำเร็จ: {err}\nรีเซ็ตยอดรายวันเป็น 0 แล้ว"
 
@@ -1375,14 +1375,11 @@ def card_callback():
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
-    # Feishu อาจส่ง open_message_id ไว้ใน context หรือ top-level
-    context = data.get("context", {})
-    open_message_id = (
-        data.get("open_message_id", "")
-        or context.get("open_message_id", "")
-    )
-    action = data.get("action", {})
+    event = data.get("event", {})
+    action = event.get("action", {})
+    context = event.get("context", {})
     command = action.get("value", {}).get("command", "")
+    open_message_id = context.get("open_message_id", "")
     print(f"[CARD_CALLBACK] command={command!r} message_id={open_message_id!r}", flush=True)
 
     if command and open_message_id:
