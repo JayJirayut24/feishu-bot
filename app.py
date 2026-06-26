@@ -1370,12 +1370,20 @@ def webhook():
 @app.route("/card_callback", methods=["POST"])
 def card_callback():
     data = request.json or {}
+    print(f"[CARD_CALLBACK] raw data: {json.dumps(data, ensure_ascii=False)}", flush=True)
 
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
-    command = data.get("action", {}).get("value", {}).get("command", "")
-    open_message_id = data.get("open_message_id", "")
+    # Feishu อาจส่ง open_message_id ไว้ใน context หรือ top-level
+    context = data.get("context", {})
+    open_message_id = (
+        data.get("open_message_id", "")
+        or context.get("open_message_id", "")
+    )
+    action = data.get("action", {})
+    command = action.get("value", {}).get("command", "")
+    print(f"[CARD_CALLBACK] command={command!r} message_id={open_message_id!r}", flush=True)
 
     if command and open_message_id:
         fake_event = {
