@@ -123,9 +123,11 @@ def get_user_display_name(open_id, token):
             headers={"Authorization": f"Bearer {token}"},
             timeout=5,
         ).json()
+        print(f"[GET_NAME] open_id={open_id} response={res}", flush=True)
         name = res.get("data", {}).get("user", {}).get("name", "")
         return name if name else open_id[-8:]
-    except Exception:
+    except Exception as e:
+        print(f"[GET_NAME] error: {e}", flush=True)
         return open_id[-8:]
 
 
@@ -1114,7 +1116,7 @@ def process_event(data):
                     msg += f"รวมทั้งเดือน: {total:,} รายการ"
 
                 if pressed_by:
-                    msg += f"\n👤 กดโดย: {pressed_by}"
+                    msg += f"\n👤 : {pressed_by}"
                 reply_message(message_id, msg, token)
                 send_menu_card(message_id, token)
                 return
@@ -1411,9 +1413,12 @@ def card_callback():
     open_message_id = context.get("open_message_id", "")
     open_id = event.get("operator", {}).get("open_id", "")
 
+    print(f"[CARD_CALLBACK] command={command!r} open_message_id={open_message_id!r} open_id={open_id!r}", flush=True)
     if command and open_message_id:
         cb_token = get_tenant_access_token()
+        print(f"[CARD_CALLBACK] calling get_user_display_name...", flush=True)
         pressed_by = get_user_display_name(open_id, cb_token) if open_id else ""
+        print(f"[CARD_CALLBACK] pressed_by={pressed_by!r}", flush=True)
         fake_event = {
             "header": {"event_type": "im.message.receive_v1"},
             "event": {
