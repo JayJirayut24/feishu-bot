@@ -17,6 +17,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------
 processed_event_ids = set()
 processed_event_lock = threading.Lock()
+MAX_PROCESSED_EVENTS = 500
 
 # ---------------------------------------------------------
 # ตั้งค่า App ID และ App Secret ของ Feishu
@@ -56,19 +57,26 @@ STATE_FILE = "state.json"
 app_state = {
     "current_date": "",
     "daily_count": 0,
-    "branch_summary": {}
+    "branch_summary": {},
+    "processed_events": []
 }
+_sheet_write_lock = threading.Lock()
 
-# โหลดข้อมูลเก่าถ้ามี
+# โหลดข้อมูลเก่าถ้ามี (รวม processed_events เพื่อป้องกัน Feishu retry หลัง bot restart)
 if os.path.exists(STATE_FILE):
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             app_state = json.load(f)
+            if "processed_events" not in app_state:
+                app_state["processed_events"] = []
     except:
         pass
 
+processed_event_ids = set(app_state.get("processed_events", []))
+
 def save_state():
     try:
+        app_state["processed_events"] = list(processed_event_ids)[-MAX_PROCESSED_EVENTS:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(app_state, f, ensure_ascii=False)
     except:
@@ -619,72 +627,73 @@ def write_song_sheet(spreadsheet_token, sheet_id, awb_list, branch_codes, timest
         "Content-Type": "application/json"
     }
 
-    # อ่านครั้งเดียว A2:H5000 — ใช้หา next_row และนับยอดวันนี้พร้อมกัน
-    read_url = (
-        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-        f"{spreadsheet_token}/values/{sheet_id}!A2:H5000"
-    )
-    tz = timezone(timedelta(hours=7))
-    today_date = datetime.now(tz).strftime("%d/%m/%Y")
-    next_row = 2
-    today_count_before = 0
-    try:
-        raw = (
-            requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
-            .json()
-            .get("data", {}).get("valueRange", {}).get("values") or []
+    with _sheet_write_lock:
+        # อ่านครั้งเดียว A2:H5000 — ใช้หา next_row และนับยอดวันนี้พร้อมกัน
+        read_url = (
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+            f"{spreadsheet_token}/values/{sheet_id}!A2:H5000"
         )
-        last_idx = -1
-        for i, row in enumerate(raw):
-            if row and row[0] not in (None, "", "None"):
-                last_idx = i
-                time_val = str(row[7]).strip() if len(row) > 7 and row[7] else ""
-                if today_date in time_val:
-                    today_count_before += 1
-        if last_idx >= 0:
-            next_row = last_idx + 3
-    except Exception:
-        pass
+        tz = timezone(timedelta(hours=7))
+        today_date = datetime.now(tz).strftime("%d/%m/%Y")
+        next_row = 2
+        today_count_before = 0
+        try:
+            raw = (
+                requests.get(read_url, headers={"Authorization": f"Bearer {token}"})
+                .json()
+                .get("data", {}).get("valueRange", {}).get("values") or []
+            )
+            last_idx = -1
+            for i, row in enumerate(raw):
+                if row and row[0] not in (None, "", "None"):
+                    last_idx = i
+                    time_val = str(row[7]).strip() if len(row) > 7 and row[7] else ""
+                    if today_date in time_val:
+                        today_count_before += 1
+            if last_idx >= 0:
+                next_row = last_idx + 3
+        except Exception:
+            pass
 
-    n = len(awb_list)
-    if n == 0:
-        return {"code": 0}, today_count_before
-    end_row = next_row + n - 1
+        n = len(awb_list)
+        if n == 0:
+            return {"code": 0}, today_count_before
+        end_row = next_row + n - 1
 
-    # Batch PUT: รวม A, F, H, I เป็น 1 API call เดียว
-    f_values = [
-        [branch_codes[i] if branch_codes and i < len(branch_codes) else ""]
-        for i in range(n)
-    ]
-    value_ranges = [
-        {"range": f"{sheet_id}!A{next_row}:A{end_row}", "values": [[awb] for awb in awb_list]},
-        {"range": f"{sheet_id}!F{next_row}:F{end_row}", "values": f_values},
-        {"range": f"{sheet_id}!H{next_row}:H{end_row}", "values": [[timestamp]] * n},
-    ]
-    col_i_val = filename if filename else sender_name
-    if col_i_val:
-        value_ranges.append({"range": f"{sheet_id}!I{next_row}:I{end_row}", "values": [[col_i_val]] * n})
+        # Batch PUT: รวม A, F, H, I เป็น 1 API call เดียว
+        f_values = [
+            [branch_codes[i] if branch_codes and i < len(branch_codes) else ""]
+            for i in range(n)
+        ]
+        value_ranges = [
+            {"range": f"{sheet_id}!A{next_row}:A{end_row}", "values": [[awb] for awb in awb_list]},
+            {"range": f"{sheet_id}!F{next_row}:F{end_row}", "values": f_values},
+            {"range": f"{sheet_id}!H{next_row}:H{end_row}", "values": [[timestamp]] * n},
+        ]
+        col_i_val = filename if filename else sender_name
+        if col_i_val:
+            value_ranges.append({"range": f"{sheet_id}!I{next_row}:I{end_row}", "values": [[col_i_val]] * n})
 
-    values_url = (
-        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
-        f"{spreadsheet_token}/values"
-    )
-    for vr in value_ranges:
-        for attempt in range(3):
-            resp = None
-            try:
-                resp = requests.put(values_url, headers=api_headers, json={"valueRange": vr})
-                res = resp.json()
-                if res.get("code") == 0:
-                    break
-                if attempt == 2:
-                    return {"code": -1, "msg": res.get("msg", "write failed")}, today_count_before
-            except Exception as e:
-                if attempt == 2:
-                    raw = resp.text[:100] if resp is not None else "no response"
-                    return {"code": -1, "msg": f"{str(e)} | raw={raw}"}, today_count_before
-            time.sleep(1)
-    return {"code": 0}, today_count_before + n
+        values_url = (
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+            f"{spreadsheet_token}/values"
+        )
+        for vr in value_ranges:
+            for attempt in range(3):
+                resp = None
+                try:
+                    resp = requests.put(values_url, headers=api_headers, json={"valueRange": vr})
+                    res = resp.json()
+                    if res.get("code") == 0:
+                        break
+                    if attempt == 2:
+                        return {"code": -1, "msg": res.get("msg", "write failed")}, today_count_before
+                except Exception as e:
+                    if attempt == 2:
+                        raw = resp.text[:100] if resp is not None else "no response"
+                        return {"code": -1, "msg": f"{str(e)} | raw={raw}"}, today_count_before
+                time.sleep(1)
+        return {"code": 0}, today_count_before + n
 
 
 # ---------------------------------------------------------
@@ -1178,7 +1187,7 @@ def process_event(data):
                     summary_text += f"รวมทั้งหมด: {total_count} รายการ"
 
                 if pressed_by:
-                    summary_text += f"\n👤 กดโดย: {pressed_by}"
+                    summary_text += f"\n👤: {pressed_by}"
                 reply_message(message_id, summary_text, token)
 
                 # บันทึก log รายวันลง Sheet สรุปยอดยิงส่ง (ถ้ามีข้อมูล)
@@ -1375,17 +1384,14 @@ def webhook():
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
-    # ขั้นตอนที่ 2: ตรวจสอบ event_id ไม่ให้ประมวลผลซ้ำ
+    # ขั้นตอนที่ 2: ตรวจสอบ event_id ไม่ให้ประมวลผลซ้ำ (รอด bot restart)
     event_id = data.get("header", {}).get("event_id")
     if event_id:
         with processed_event_lock:
             if event_id in processed_event_ids:
                 return jsonify({"status": "ok"})
             processed_event_ids.add(event_id)
-            # เก็บแค่ 1000 event ล่าสุด ป้องกัน memory leak
-            if len(processed_event_ids) > 1000:
-                oldest = next(iter(processed_event_ids))
-                processed_event_ids.discard(oldest)
+            save_state()
 
     # ขั้นตอนที่ 3: รันการประมวลผลใน Background Thread
     thread = threading.Thread(target=process_event, args=(data,))
