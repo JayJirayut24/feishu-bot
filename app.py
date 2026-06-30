@@ -778,6 +778,87 @@ def reply_message(message_id, text, token):
 
 
 # ---------------------------------------------------------
+# สร้างกราฟแท่งด้วย QuickChart.io แล้วส่งเป็นรูปภาพ
+# ---------------------------------------------------------
+def send_bar_chart(message_id, title, branch_summary, token):
+    try:
+        sorted_items = sorted(branch_summary.items(), key=lambda x: -x[1])
+        labels = [br for br, _ in sorted_items]
+        data = [cnt for _, cnt in sorted_items]
+
+        chart_config = {
+            "backgroundColor": "white",
+            "width": 700,
+            "height": 450,
+            "chart": {
+                "type": "bar",
+                "data": {
+                    "labels": labels,
+                    "datasets": [{
+                        "label": "จำนวน AWB",
+                        "data": data,
+                        "backgroundColor": "rgba(99, 132, 255, 0.85)"
+                    }]
+                },
+                "options": {
+                    "title": {
+                        "display": True,
+                        "text": title,
+                        "fontSize": 16
+                    },
+                    "plugins": {
+                        "datalabels": {
+                            "anchor": "center",
+                            "align": "center",
+                            "color": "white",
+                            "font": {"weight": "bold", "size": 13}
+                        }
+                    },
+                    "scales": {
+                        "yAxes": [{"ticks": {"beginAtZero": True}}]
+                    }
+                }
+            }
+        }
+
+        res = requests.post(
+            "https://quickchart.io/chart",
+            json=chart_config,
+            timeout=15
+        )
+        if res.status_code != 200 or not res.content:
+            print(f"[CHART] quickchart failed: {res.status_code}", flush=True)
+            return
+
+        upload_res = requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"image_type": "message"},
+            files={"image": ("chart.png", res.content, "image/png")}
+        ).json()
+
+        img_key = upload_res.get("data", {}).get("image_key")
+        if not img_key:
+            print(f"[CHART] upload failed: {upload_res}", flush=True)
+            return
+
+        requests.post(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8"
+            },
+            json={
+                "msg_type": "image",
+                "content": json.dumps({"image_key": img_key})
+            }
+        )
+        print(f"[CHART] sent chart image for '{title}'", flush=True)
+    except Exception as e:
+        print(f"[CHART] error: {e}", flush=True)
+
+
+# ---------------------------------------------------------
 # ส่ง Interactive Card พร้อมปุ่มเมนู
 # ---------------------------------------------------------
 def send_menu_card(message_id, token):
@@ -1127,6 +1208,13 @@ def process_event(data):
                 if pressed_by:
                     msg += f"\n👤 : {pressed_by}"
                 reply_message(message_id, msg, token)
+
+                if monthly_branch:
+                    threading.Thread(
+                        target=send_bar_chart,
+                        args=(message_id, f"สรุปยอดเดือน {month_display}", monthly_branch, token)
+                    ).start()
+
                 send_menu_card(message_id, token)
                 return
 
@@ -1189,6 +1277,12 @@ def process_event(data):
                 if pressed_by:
                     summary_text += f"\n👤: {pressed_by}"
                 reply_message(message_id, summary_text, token)
+
+                if total_count > 0 and branch_summary:
+                    threading.Thread(
+                        target=send_bar_chart,
+                        args=(message_id, f"สรุปยอดวันที่ {today_str}", branch_summary, token)
+                    ).start()
 
                 # บันทึก log รายวันลง Sheet สรุปยอดยิงส่ง (ถ้ามีข้อมูล)
                 if total_count > 0 and branch_summary and stoken:
