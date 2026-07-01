@@ -210,7 +210,7 @@ def extract_data_from_excel(file_bytes):
                 awb_str = ""
                 if awb_col is not None and awb_col < len(row):
                     candidate = _cell_to_str(row[awb_col])
-                    if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
+                    if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate) or re.match(r'^JTTH\d+$', candidate):
                         awb_str = candidate
 
                 if not awb_str:
@@ -218,7 +218,7 @@ def extract_data_from_excel(file_bytes):
                         if j == correct_branch_col:
                             continue
                         candidate = _cell_to_str(cell)
-                        if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate):
+                        if re.match(r'^\d{12}$', candidate) or re.match(r'^B\d+$', candidate) or re.match(r'^JTTH\d+$', candidate):
                             awb_str = candidate
                             break
 
@@ -249,7 +249,7 @@ def extract_data_from_excel(file_bytes):
             if all_rows:
                 first_row_cells = [_cell_to_str(c) for c in (all_rows[0] or []) if c is not None]
                 has_data = any(
-                    re.match(r'^\d{12}$', v) or re.match(r'^B\d+$', v) or re.match(r'^\d{6}$', v)
+                    re.match(r'^\d{12}$', v) or re.match(r'^B\d+$', v) or re.match(r'^JTTH\d+$', v) or re.match(r'^\d{6}$', v)
                     for v in first_row_cells
                 )
                 if not has_data:
@@ -280,6 +280,8 @@ def extract_data_from_excel(file_bytes):
                     if re.match(r'^\d{12}$', cell_str):
                         awb_list.append(cell_str)
                     elif re.match(r'^B\d+$', cell_str):
+                        awb_list.append(cell_str)
+                    elif re.match(r'^JTTH\d+$', cell_str):
                         awb_list.append(cell_str)
                     elif re.match(r'^\d{6}$', cell_str):
                         branch_codes.append(cell_str)
@@ -1312,6 +1314,8 @@ def process_event(data):
                 line_awbs.extend(re.findall(r'(?<!\d)\d{12}(?!\d)', line))
                 # ค้นหารหัส B
                 line_awbs.extend(re.findall(r'\bB\d+\b', line))
+                # ค้นหารหัส JTTH
+                line_awbs.extend(re.findall(r'\bJTTH\d+\b', line))
                 # ค้นหารหัสสาขา 6 หลัก
                 line_branches = re.findall(r'(?<!\d)\d{6}(?!\d)', line)
 
