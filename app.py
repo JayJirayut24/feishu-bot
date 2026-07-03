@@ -1322,8 +1322,8 @@ def process_event(data):
             
             for line in lines:
                 line_awbs = []
-                # ค้นหาเลข 12 หลัก
-                line_awbs.extend(re.findall(r'(?<!\d)\d{12}(?!\d)', line))
+                # ค้นหาเลข 12 หลัก (ไม่จับตัวเลขที่อยู่ติดกับตัวอักษร เช่น ส่วนใน JTTH...)
+                line_awbs.extend(re.findall(r'(?<![A-Za-z\d])\d{12}(?!\d)', line))
                 # ค้นหารหัส B
                 line_awbs.extend(re.findall(r'\bB\d+\b', line))
                 # ค้นหารหัส JTTH
