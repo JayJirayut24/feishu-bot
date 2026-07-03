@@ -940,6 +940,18 @@ def process_event(data):
             file_name = content.get("file_name", "")
 
             if file_name.endswith(".xlsx"):
+                tz = timezone(timedelta(hours=7))
+                if datetime.now(tz).hour >= 20:
+                    reply_message(
+                        message_id,
+                        "⛔ เกินเวลาการส่งไฟล์แล้ว ⛔\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "📂 ส่งไฟล์ได้ถึง 20:00 น. เท่านั้น\n"
+                        "📞 กรุณารอ IT มาตอบกลับ",
+                        token
+                    )
+                    return
+
                 is_valid_input = True
                 reply_message(message_id, f"⏳ กำลังประมวลผลไฟล์ '{file_name}'...", token)
 
@@ -1426,7 +1438,7 @@ def process_event(data):
             for sname, sid in sheet_ids.items():
                 if sname != BRANCH_CODE_SHEET and awb_list:
                     rows = [
-                        [awb, None, None, None, None, today_time_str, file_name]
+                        [awb, None, None, None, None, None, file_name]
                         for awb in awb_list
                     ]
                     tung_out[0] = append_to_feishu_sheet(spreadsheet_token, sid, rows, "A", token)
